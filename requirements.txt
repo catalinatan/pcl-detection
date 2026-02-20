@@ -1,0 +1,17 @@
+# Core ML/DL Libraries
+torch>=2.6.0
+torchvision
+numpy>=1.26.0,<2.0
+transformers>=4.30.0
+
+# Scikit-learn for metrics and preprocessing
+scikit-learn>=1.3.0
+
+# NLP Libraries
+spacy>=3.5.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Additional dependencies (usually installed with above packages)
+tqdm>=4.65.0

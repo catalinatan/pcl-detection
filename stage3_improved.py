@@ -373,8 +373,33 @@ def run_ensemble(
     for ckpt_dir, label in [(baseline_ckpt, "baseline"), (novel_ckpt, "novel")]:
         if not Path(ckpt_dir).exists():
             logger.error(f"Checkpoint not found: {ckpt_dir}")
-            logger.error(f"Run `python stage3.py --mode both` first to generate checkpoints.")
+            logger.error("Run `python stage3.py --mode both` first to generate checkpoints.")
             return None
+        # Validate that key files are non-empty (catch corrupt saves).
+        for fname in ["tokenizer.json", "model.safetensors"]:
+            fpath = Path(ckpt_dir) / fname
+            if not fpath.exists():
+                # Also accept pytorch_bin format.
+                if fname == "model.safetensors" and (Path(ckpt_dir) / "pytorch_model.bin").exists():
+                    continue
+                logger.error(f"Missing file: {fpath}")
+                logger.error("Run `python stage3.py --mode both` first to generate checkpoints.")
+                return None
+            if fpath.stat().st_size == 0:
+                logger.error(f"Corrupt (0-byte) file: {fpath}")
+                logger.error("Delete the checkpoint dir and re-run `python stage3.py --mode novel`.")
+                return None
+        # Quick JSON validity check on tokenizer.json.
+        tok_path = Path(ckpt_dir) / "tokenizer.json"
+        if tok_path.exists():
+            try:
+                import json
+                with open(tok_path, "r") as f:
+                    json.load(f)
+            except (json.JSONDecodeError, Exception) as e:
+                logger.error(f"Corrupt tokenizer file: {tok_path} — {e}")
+                logger.error("Delete the checkpoint dir and re-run `python stage3.py --mode novel`.")
+                return None
 
     # Load both models.
     models = {}

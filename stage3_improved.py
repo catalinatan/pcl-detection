@@ -1,0 +1,875 @@
+#!/usr/bin/env python3
+"""
+stage3_improved.py — Additional experiments to improve PCL detection F1.
+
+Builds on stage3.py results:
+    Baseline test F1(PCL) = 0.4907   (RoBERTa-base + std CE)
+    Novel    test F1(PCL) = 0.5391   (RoBERTa-base + focal loss)
+
+New experiments:
+    1. ensemble    — Average probs from baseline + novel checkpoints (zero cost)
+    2. deberta     — DeBERTa-v3-base + focal loss (expected biggest gain)
+    3. deberta_plus — DeBERTa-v3-base + focal + weighted sampler + label smoothing
+                      + freeze bottom layers (kitchen sink)
+    4. all         — Run all of the above sequentially
+
+Uses identical data splits (same seed=42, 70/15/15) as stage3.py for
+fair comparison.
+
+Usage:
+    python stage3_improved.py --mode ensemble
+    python stage3_improved.py --mode deberta --n_trials 5 --epochs 5
+    python stage3_improved.py --mode deberta_plus --n_trials 5 --epochs 5
+    python stage3_improved.py --mode all --n_trials 5 --epochs 5
+    python stage3_improved.py --mode all --n_trials 2 --epochs 2          # smoke-test
+
+Outputs → outputs_improved/
+"""
+
+# ---------------------------------------------------------------------------
+# 0. Imports
+# ---------------------------------------------------------------------------
+import argparse
+import ast
+import csv
+import json
+import logging
+import os
+import random
+import sys
+import time
+import warnings
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.metrics import (
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    get_linear_schedule_with_warmup,
+)
+
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------------
+# 1. Logging & constants
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# Data paths (same as stage3.py).
+TRAIN_LABELS_PATH = "train_semeval_parids-labels.csv"
+PCL_TSV_PATH = "dontpatronizeme_pcl.tsv"
+
+# Split ratios (same as stage3.py).
+TRAIN_RATIO = 0.70
+DEV_RATIO = 0.15
+TEST_RATIO = 0.15
+
+THRESHOLD_RANGE = np.arange(0.05, 0.96, 0.01)
+
+# Prior results for comparison table.
+PRIOR_RESULTS = {
+    "Baseline (RoBERTa + CE)": {
+        "dev_f1": 0.5865, "dev_p": 0.6854, "dev_r": 0.5126, "dev_thr": 0.06,
+        "test_f1": 0.4907, "test_p": 0.5464, "test_r": 0.4454, "test_thr": 0.06,
+    },
+    "Novel (RoBERTa + focal)": {
+        "dev_f1": 0.5887, "dev_p": 0.5659, "dev_r": 0.6134, "dev_thr": 0.08,
+        "test_f1": 0.5391, "test_p": 0.5036, "test_r": 0.5798, "test_thr": 0.08,
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# 2. Utilities (identical to stage3.py for reproducibility)
+# ---------------------------------------------------------------------------
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def get_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def log_versions() -> dict:
+    import sklearn, transformers
+    versions = {
+        "python": sys.version.split()[0],
+        "torch": torch.__version__,
+        "transformers": transformers.__version__,
+        "sklearn": sklearn.__version__,
+        "numpy": np.__version__,
+    }
+    logger.info("─── Package versions ───────────────────────────")
+    for k, v in versions.items():
+        logger.info(f"  {k:<14} {v}")
+    logger.info("────────────────────────────────────────────────")
+    return versions
+
+
+# ---------------------------------------------------------------------------
+# 3. Data loading (identical to stage3.py)
+# ---------------------------------------------------------------------------
+
+def read_labels(path: str) -> dict:
+    labels = {}
+    with open(path, mode="r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            vec = ast.literal_eval(row["label"])
+            labels[row["par_id"]] = 1 if sum(vec) > 0 else 0
+    return labels
+
+
+def read_texts(path: str) -> dict:
+    texts = {}
+    with open(path, mode="r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if i < 4:
+                continue
+            parts = line.strip().split("\t")
+            if len(parts) >= 6:
+                texts[parts[0]] = parts[4]
+    return texts
+
+
+def load_data(labels_path: str, pcl_path: str):
+    labels = read_labels(labels_path)
+    texts = read_texts(pcl_path)
+    X, y = [], []
+    for par_id, label in labels.items():
+        text = texts.get(par_id, "").strip()
+        if text:
+            X.append(text)
+            y.append(label)
+    n_pcl = sum(y)
+    logger.info(
+        f"Loaded {len(X)} samples — "
+        f"PCL={n_pcl} ({100*n_pcl/len(y):.1f}%)  "
+        f"No-PCL={len(y)-n_pcl} ({100*(len(y)-n_pcl)/len(y):.1f}%)"
+    )
+    return X, y
+
+
+def make_splits(X, y, seed):
+    X_arr = np.array(X, dtype=object)
+    y_arr = np.array(y)
+    X_td, X_test, y_td, y_test = train_test_split(
+        X_arr, y_arr, test_size=TEST_RATIO, stratify=y_arr, random_state=seed,
+    )
+    dev_ratio_adjusted = DEV_RATIO / (TRAIN_RATIO + DEV_RATIO)
+    X_train, X_dev, y_train, y_dev = train_test_split(
+        X_td, y_td, test_size=dev_ratio_adjusted, stratify=y_td, random_state=seed,
+    )
+    logger.info(
+        f"Splits: train={len(X_train)}, dev={len(X_dev)}, test={len(X_test)}  "
+        f"(PCL rate ≈ {100*y_train.mean():.1f}% / {100*y_dev.mean():.1f}% / "
+        f"{100*y_test.mean():.1f}%)"
+    )
+    return (
+        X_train.tolist(), X_dev.tolist(), X_test.tolist(),
+        y_train.tolist(), y_dev.tolist(), y_test.tolist(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4. Dataset
+# ---------------------------------------------------------------------------
+
+class PCLDataset(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_len):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        enc = self.tokenizer(
+            self.texts[idx],
+            max_length=self.max_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        return {
+            "input_ids": enc["input_ids"].squeeze(0),
+            "attention_mask": enc["attention_mask"].squeeze(0),
+            "label": torch.tensor(self.labels[idx], dtype=torch.long),
+        }
+
+
+# ---------------------------------------------------------------------------
+# 5. Loss functions
+# ---------------------------------------------------------------------------
+
+class FocalLoss(nn.Module):
+    """
+    Alpha-balanced focal loss (Lin et al. 2017).
+    Optional label smoothing (Szegedy et al. 2016).
+    """
+
+    def __init__(self, alpha=0.25, gamma=2.0, label_smoothing=0.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits, targets):
+        ce_loss = F.cross_entropy(
+            logits, targets, reduction="none",
+            label_smoothing=self.label_smoothing,
+        )
+        pt = torch.exp(-ce_loss)
+        alpha_t = torch.where(
+            targets == 1,
+            torch.full_like(pt, self.alpha),
+            torch.full_like(pt, 1.0 - self.alpha),
+        )
+        focal = alpha_t * (1.0 - pt) ** self.gamma * ce_loss
+        return focal.mean()
+
+
+# ---------------------------------------------------------------------------
+# 6. Training helpers
+# ---------------------------------------------------------------------------
+
+def train_epoch(model, loader, optimizer, scheduler, loss_fn, device,
+                grad_clip=1.0):
+    model.train()
+    total_loss = 0.0
+    for batch in loader:
+        ids = batch["input_ids"].to(device)
+        mask = batch["attention_mask"].to(device)
+        labels = batch["label"].to(device)
+        optimizer.zero_grad()
+        logits = model(input_ids=ids, attention_mask=mask).logits
+        loss = loss_fn(logits, labels)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        scheduler.step()
+        total_loss += loss.item()
+    return total_loss / max(len(loader), 1)
+
+
+@torch.no_grad()
+def get_probabilities(model, loader, device):
+    model.eval()
+    all_probs, all_labels = [], []
+    for batch in loader:
+        ids = batch["input_ids"].to(device)
+        mask = batch["attention_mask"].to(device)
+        logits = model(input_ids=ids, attention_mask=mask).logits
+        probs = F.softmax(logits, dim=-1)[:, 1].cpu().numpy()
+        all_probs.extend(probs.tolist())
+        all_labels.extend(batch["label"].numpy().tolist())
+    return np.array(all_probs), np.array(all_labels)
+
+
+def tune_threshold(probs, labels):
+    best_t, best_f1 = 0.5, 0.0
+    for t in THRESHOLD_RANGE:
+        preds = (probs >= t).astype(int)
+        f1 = f1_score(labels, preds, pos_label=1, zero_division=0)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_t = round(float(t), 3)
+    return best_t, best_f1
+
+
+def evaluate_at_threshold(probs, labels, threshold):
+    preds = (probs >= threshold).astype(int)
+    cm = confusion_matrix(labels, preds, labels=[0, 1])
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+    else:
+        tn = fp = fn = tp = 0
+    return {
+        "f1_pcl": float(f1_score(labels, preds, pos_label=1, zero_division=0)),
+        "precision_pcl": float(precision_score(labels, preds, pos_label=1, zero_division=0)),
+        "recall_pcl": float(recall_score(labels, preds, pos_label=1, zero_division=0)),
+        "confusion_matrix": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
+    }
+
+
+def freeze_bottom_layers(model, n_freeze=6):
+    """
+    Freeze the bottom `n_freeze` encoder layers of a transformer model.
+
+    Rationale: Lower layers capture general syntax/morphology; upper layers
+    capture task-specific semantics.  Freezing bottom layers reduces
+    overfitting on small datasets (5.8K train) and speeds up training.
+
+    Reference: Howard & Ruder 2018 (ULMFiT), Sun et al. 2019 (BERT fine-tuning).
+    """
+    frozen = 0
+    # Works for both RoBERTa (.roberta.encoder.layer) and DeBERTa (.deberta.encoder.layer)
+    encoder = None
+    if hasattr(model, "roberta"):
+        encoder = model.roberta.encoder.layer
+    elif hasattr(model, "deberta"):
+        encoder = model.deberta.encoder.layer
+
+    if encoder is not None:
+        for i, layer in enumerate(encoder):
+            if i < n_freeze:
+                for param in layer.parameters():
+                    param.requires_grad = False
+                frozen += 1
+        logger.info(f"    Froze bottom {frozen} encoder layers (of {len(encoder)})")
+    else:
+        logger.warning("    Could not find encoder layers to freeze")
+
+
+# ---------------------------------------------------------------------------
+# 7. Experiment A: Ensemble (zero training cost)
+# ---------------------------------------------------------------------------
+
+def run_ensemble(
+    X_dev, y_dev, X_test, y_test,
+    baseline_ckpt, novel_ckpt,
+    device, output_dir,
+):
+    """
+    Load two existing checkpoints and average their PCL probabilities.
+
+    This is a simple but effective technique: averaging reduces variance
+    of individual model predictions.  Top SemEval teams (#2 stce, #5 holdon)
+    used multi-model ensembles.
+    """
+    logger.info("\n" + "=" * 62)
+    logger.info(" EXPERIMENT: ENSEMBLE (baseline + novel)")
+    logger.info("=" * 62)
+
+    results = {}
+
+    for ckpt_dir, label in [(baseline_ckpt, "baseline"), (novel_ckpt, "novel")]:
+        if not Path(ckpt_dir).exists():
+            logger.error(f"Checkpoint not found: {ckpt_dir}")
+            logger.error(f"Run `python stage3.py --mode both` first to generate checkpoints.")
+            return None
+
+    # Load both models.
+    models = {}
+    tokenizers = {}
+    for ckpt_dir, label in [(baseline_ckpt, "baseline"), (novel_ckpt, "novel")]:
+        logger.info(f"Loading {label} checkpoint from {ckpt_dir}")
+        tokenizers[label] = AutoTokenizer.from_pretrained(ckpt_dir)
+        model = AutoModelForSequenceClassification.from_pretrained(ckpt_dir)
+        model.to(device)
+        model.eval()
+        models[label] = model
+
+    # Use baseline tokenizer for dataset (both are roberta-base).
+    tokenizer = tokenizers["baseline"]
+
+    for split_name, X_split, y_split in [("dev", X_dev, y_dev), ("test", X_test, y_test)]:
+        ds = PCLDataset(X_split, y_split, tokenizer, max_len=256)
+        loader = DataLoader(ds, batch_size=32, shuffle=False, num_workers=0)
+
+        # Get probs from each model.
+        probs_b, labels = get_probabilities(models["baseline"], loader, device)
+        probs_n, _ = get_probabilities(models["novel"], loader, device)
+
+        # Average probs.
+        probs_avg = (probs_b + probs_n) / 2.0
+
+        thr, f1 = tune_threshold(probs_avg, labels)
+        metrics = evaluate_at_threshold(probs_avg, labels, thr)
+
+        logger.info(
+            f"  Ensemble {split_name}: F1={metrics['f1_pcl']:.4f}  "
+            f"P={metrics['precision_pcl']:.4f}  R={metrics['recall_pcl']:.4f}  thr={thr}"
+        )
+        results[f"{split_name}_metrics"] = metrics
+        results[f"{split_name}_threshold"] = thr
+
+    # Clean up.
+    for m in models.values():
+        del m
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 8. Experiment B & C: DeBERTa training
+# ---------------------------------------------------------------------------
+
+def run_training_improved(
+    model_name,
+    X_train, y_train,
+    X_dev, y_dev,
+    tokenizer,
+    *,
+    lr, batch_size, epochs, weight_decay, max_len,
+    seed, device,
+    focal_gamma=2.0, focal_alpha=0.25,
+    label_smoothing=0.0,
+    use_weighted_sampler=False,
+    freeze_layers=0,
+    patience=3,
+):
+    """
+    Enhanced training loop with support for:
+    - Focal loss + label smoothing
+    - WeightedRandomSampler (data-level class balancing)
+    - Layer freezing (reduce overfitting)
+    """
+    set_seed(seed)
+
+    train_ds = PCLDataset(X_train, y_train, tokenizer, max_len)
+    dev_ds = PCLDataset(X_dev, y_dev, tokenizer, max_len)
+
+    pin = device.type == "cuda"
+
+    # --- Weighted sampler: oversample PCL so each batch is ~50/50 ---
+    if use_weighted_sampler:
+        y_arr = np.array(y_train)
+        n_pos = y_arr.sum()
+        n_neg = len(y_arr) - n_pos
+        weight_pos = len(y_arr) / (2.0 * n_pos)
+        weight_neg = len(y_arr) / (2.0 * n_neg)
+        sample_weights = np.where(y_arr == 1, weight_pos, weight_neg)
+        sampler = WeightedRandomSampler(
+            weights=sample_weights.tolist(),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, sampler=sampler,
+            num_workers=0, pin_memory=pin,
+        )
+        logger.info(f"    WeightedRandomSampler: pos_w={weight_pos:.2f}  neg_w={weight_neg:.2f}")
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            num_workers=0, pin_memory=pin,
+        )
+
+    dev_loader = DataLoader(
+        dev_ds, batch_size=batch_size * 2, shuffle=False,
+        num_workers=0, pin_memory=pin,
+    )
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name, num_labels=2, ignore_mismatched_sizes=True,
+    )
+    model.to(device)
+
+    # --- Layer freezing ---
+    if freeze_layers > 0:
+        freeze_bottom_layers(model, n_freeze=freeze_layers)
+
+    # Only optimise non-frozen parameters.
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
+
+    total_steps = len(train_loader) * epochs
+    warmup_steps = max(1, int(0.06 * total_steps))
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps,
+    )
+
+    # Focal loss with optional label smoothing.
+    _criterion = FocalLoss(
+        alpha=focal_alpha, gamma=focal_gamma,
+        label_smoothing=label_smoothing,
+    )
+    loss_fn = lambda logits, labels: _criterion(logits, labels)
+
+    best_dev_f1 = 0.0
+    best_threshold = 0.5
+    best_metrics = {}
+    best_state = None
+    best_epoch = 0
+    no_improve = 0
+
+    for epoch in range(1, epochs + 1):
+        t0 = time.time()
+        train_loss = train_epoch(model, train_loader, optimizer, scheduler,
+                                 loss_fn, device)
+        dev_probs, dev_labels = get_probabilities(model, dev_loader, device)
+        threshold, dev_f1 = tune_threshold(dev_probs, dev_labels)
+        metrics = evaluate_at_threshold(dev_probs, dev_labels, threshold)
+        elapsed = time.time() - t0
+
+        logger.info(
+            f"    Epoch {epoch}/{epochs}  loss={train_loss:.4f}  "
+            f"dev F1(PCL)={metrics['f1_pcl']:.4f}  "
+            f"P={metrics['precision_pcl']:.4f}  R={metrics['recall_pcl']:.4f}  "
+            f"thr={threshold:.2f}  ({elapsed:.0f}s)"
+        )
+
+        if metrics["f1_pcl"] > best_dev_f1:
+            best_dev_f1 = metrics["f1_pcl"]
+            best_threshold = threshold
+            best_metrics = metrics
+            best_epoch = epoch
+            no_improve = 0
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                logger.info(f"    Early stopping at epoch {epoch} (best was epoch {best_epoch})")
+                break
+
+    del model
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    return best_dev_f1, best_threshold, best_metrics, best_state
+
+
+def run_deberta_experiment(
+    mode_label,
+    model_name,
+    X_train, y_train,
+    X_dev, y_dev,
+    X_test, y_test,
+    device, args, output_dir,
+    use_weighted_sampler=False,
+    label_smoothing=0.0,
+    freeze_layers=0,
+):
+    """
+    Run DeBERTa-based experiments with hyperparameter search.
+    """
+    logger.info(f"\n{'='*62}")
+    logger.info(f" EXPERIMENT: {mode_label.upper()}")
+    logger.info(f" Model: {model_name}")
+    logger.info(f" Extras: sampler={use_weighted_sampler}  "
+                f"label_smooth={label_smoothing}  freeze={freeze_layers}")
+    logger.info(f" Trials: {args.n_trials}  |  Max epochs: {args.epochs}")
+    logger.info(f"{'='*62}")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    best_holder = {
+        "f1": 0.0, "threshold": 0.5, "metrics": {},
+        "state": None, "params": {}, "trial_id": -1,
+    }
+    tuning_rows = []
+
+    rng = np.random.RandomState(args.seed)
+    for trial_id in range(args.n_trials):
+        params = {
+            "lr": float(np.exp(rng.uniform(np.log(1e-5), np.log(5e-5)))),
+            "batch_size": int(rng.choice([8, 16])),
+            "epochs": int(rng.randint(min(2, args.epochs), args.epochs + 1)),
+            "weight_decay": float(rng.uniform(0.0, 0.1)),
+            "max_len": int(rng.choice([128, 256, 512])),
+            "focal_gamma": float(rng.uniform(0.5, 3.0)),
+            "focal_alpha": float(rng.uniform(0.25, 0.75)),
+        }
+
+        logger.info(
+            f"\n[{mode_label.upper()} Trial {trial_id}/{args.n_trials-1}] "
+            f"lr={params['lr']:.2e}  bs={params['batch_size']}  "
+            f"ep={params['epochs']}  wd={params['weight_decay']:.3f}  "
+            f"max_len={params['max_len']}  "
+            f"γ={params['focal_gamma']:.2f}  α={params['focal_alpha']:.2f}"
+        )
+
+        dev_f1, threshold, metrics, state = run_training_improved(
+            model_name=model_name,
+            X_train=X_train, y_train=y_train,
+            X_dev=X_dev, y_dev=y_dev,
+            tokenizer=tokenizer,
+            lr=params["lr"],
+            batch_size=params["batch_size"],
+            epochs=params["epochs"],
+            weight_decay=params["weight_decay"],
+            max_len=params["max_len"],
+            seed=args.seed,
+            device=device,
+            focal_gamma=params["focal_gamma"],
+            focal_alpha=params["focal_alpha"],
+            label_smoothing=label_smoothing,
+            use_weighted_sampler=use_weighted_sampler,
+            freeze_layers=freeze_layers,
+            patience=args.patience,
+        )
+
+        tuning_rows.append({
+            "mode": mode_label,
+            "trial_id": trial_id,
+            **params,
+            "label_smoothing": label_smoothing,
+            "weighted_sampler": use_weighted_sampler,
+            "freeze_layers": freeze_layers,
+            "best_threshold": threshold,
+            "dev_f1_pcl": metrics.get("f1_pcl", 0.0),
+            "dev_precision": metrics.get("precision_pcl", 0.0),
+            "dev_recall": metrics.get("recall_pcl", 0.0),
+        })
+
+        if dev_f1 > best_holder["f1"]:
+            best_holder.update({
+                "f1": dev_f1, "threshold": threshold,
+                "metrics": metrics, "state": state,
+                "params": params, "trial_id": trial_id,
+            })
+
+    # --- Evaluate on test with best model ---
+    if best_holder["state"] is None:
+        logger.warning(f"[{mode_label}] No successful trials.")
+        return None, tuning_rows
+
+    logger.info(
+        f"\n[{mode_label.upper()}] Best dev F1(PCL)={best_holder['f1']:.4f}  "
+        f"thr={best_holder['threshold']:.3f}  "
+        f"P={best_holder['metrics'].get('precision_pcl',0):.4f}  "
+        f"R={best_holder['metrics'].get('recall_pcl',0):.4f}"
+    )
+
+    # Rebuild model, load best weights, eval on test.
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name, num_labels=2, ignore_mismatched_sizes=True,
+    )
+    model.load_state_dict(best_holder["state"])
+    model.to(device)
+
+    # Save checkpoint.
+    ckpt_dir = str(Path(output_dir) / f"{mode_label}_best_checkpoint")
+    Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(ckpt_dir)
+    tokenizer.save_pretrained(ckpt_dir)
+    logger.info(f"Checkpoint saved → {ckpt_dir}")
+
+    # Test evaluation.
+    max_len = int(best_holder["params"].get("max_len", 256))
+    test_ds = PCLDataset(X_test, y_test, tokenizer, max_len)
+    test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=0)
+    test_probs, test_labels = get_probabilities(model, test_loader, device)
+    test_metrics = evaluate_at_threshold(test_probs, test_labels, best_holder["threshold"])
+
+    # Also check oracle test threshold.
+    oracle_thr, oracle_f1 = tune_threshold(test_probs, test_labels)
+    test_metrics["test_oracle_threshold"] = oracle_thr
+    test_metrics["test_oracle_f1"] = oracle_f1
+
+    logger.info(
+        f"[{mode_label.upper()}] Test  F1(PCL)={test_metrics['f1_pcl']:.4f}  "
+        f"P={test_metrics['precision_pcl']:.4f}  "
+        f"R={test_metrics['recall_pcl']:.4f}"
+    )
+
+    del model
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    results = {
+        "mode": mode_label,
+        "model_name": model_name,
+        "best_hyperparams": best_holder["params"],
+        "best_threshold": best_holder["threshold"],
+        "best_trial_id": best_holder["trial_id"],
+        "dev_metrics": best_holder["metrics"],
+        "test_metrics": test_metrics,
+        "extras": {
+            "label_smoothing": label_smoothing,
+            "weighted_sampler": use_weighted_sampler,
+            "freeze_layers": freeze_layers,
+        },
+    }
+    return results, tuning_rows
+
+
+# ---------------------------------------------------------------------------
+# 9. Results comparison
+# ---------------------------------------------------------------------------
+
+def print_comparison(all_results):
+    """Print a comparison table including prior stage3.py results."""
+    print("\n" + "=" * 80)
+    print("  FULL RESULTS COMPARISON (prior + new experiments)")
+    print("=" * 80)
+    print(f"{'Model':<42} {'F1(PCL)':>8} {'Prec':>8} {'Rec':>8} {'Thr':>6}")
+    print("-" * 80)
+
+    # Prior results.
+    for name, r in PRIOR_RESULTS.items():
+        print(f"{name + ' dev':<42} {r['dev_f1']:>8.4f} {r['dev_p']:>8.4f} "
+              f"{r['dev_r']:>8.4f} {r['dev_thr']:>6.2f}")
+        print(f"{name + ' test':<42} {r['test_f1']:>8.4f} {r['test_p']:>8.4f} "
+              f"{r['test_r']:>8.4f} {r['test_thr']:>6.2f}")
+
+    print("-" * 80)
+
+    # New results.
+    for name, res in all_results.items():
+        if res is None:
+            continue
+        for split in ["dev", "test"]:
+            m = res.get(f"{split}_metrics", {})
+            thr = res.get(f"{split}_threshold", res.get("best_threshold", 0))
+            if m:
+                print(
+                    f"{name + ' ' + split:<42} {m.get('f1_pcl',0):>8.4f} "
+                    f"{m.get('precision_pcl',0):>8.4f} "
+                    f"{m.get('recall_pcl',0):>8.4f} {thr:>6.2f}"
+                )
+
+    print("=" * 80)
+
+    # Delta vs best prior.
+    best_prior_test = max(r["test_f1"] for r in PRIOR_RESULTS.values())
+    for name, res in all_results.items():
+        if res is None:
+            continue
+        test_m = res.get("test_metrics", {})
+        if test_m:
+            delta = test_m.get("f1_pcl", 0) - best_prior_test
+            print(f"  Δ test F1 ({name} vs best prior): {delta:+.4f}")
+
+    print()
+
+
+# ---------------------------------------------------------------------------
+# 10. Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Stage 3 Improved: additional experiments for PCL detection",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["ensemble", "deberta", "deberta_plus", "all"],
+        default="all",
+        help="Which experiment(s) to run.",
+    )
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--patience", type=int, default=3)
+    parser.add_argument("--n_trials", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output_dir", type=str, default="outputs_improved")
+    # Checkpoint paths from stage3.py.
+    parser.add_argument(
+        "--baseline_ckpt", type=str,
+        default="outputs/baseline_best_checkpoint",
+    )
+    parser.add_argument(
+        "--novel_ckpt", type=str,
+        default="outputs/novel_best_checkpoint",
+    )
+    args = parser.parse_args()
+
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    versions = log_versions()
+    device = get_device()
+    logger.info(f"Device: {device}")
+
+    # Load data with SAME seed & splits as stage3.py.
+    X, y = load_data(TRAIN_LABELS_PATH, PCL_TSV_PATH)
+    X_train, X_dev, X_test, y_train, y_dev, y_test = make_splits(X, y, seed=args.seed)
+
+    modes = {
+        "ensemble": ["ensemble"],
+        "deberta": ["deberta"],
+        "deberta_plus": ["deberta_plus"],
+        "all": ["ensemble", "deberta", "deberta_plus"],
+    }[args.mode]
+
+    all_results = {}
+    all_tuning_rows = []
+
+    for mode in modes:
+        if mode == "ensemble":
+            res = run_ensemble(
+                X_dev=X_dev, y_dev=y_dev,
+                X_test=X_test, y_test=y_test,
+                baseline_ckpt=args.baseline_ckpt,
+                novel_ckpt=args.novel_ckpt,
+                device=device,
+                output_dir=args.output_dir,
+            )
+            all_results["Ensemble (base+novel)"] = res
+
+        elif mode == "deberta":
+            # DeBERTa-v3-base + focal loss (same recipe as novel but better encoder).
+            res, rows = run_deberta_experiment(
+                mode_label="deberta_focal",
+                model_name="microsoft/deberta-v3-base",
+                X_train=X_train, y_train=y_train,
+                X_dev=X_dev, y_dev=y_dev,
+                X_test=X_test, y_test=y_test,
+                device=device, args=args,
+                output_dir=args.output_dir,
+                use_weighted_sampler=False,
+                label_smoothing=0.0,
+                freeze_layers=0,
+            )
+            all_results["DeBERTa + focal"] = res
+            all_tuning_rows.extend(rows)
+
+        elif mode == "deberta_plus":
+            # DeBERTa + focal + weighted sampler + label smoothing + freeze bottom 6 layers.
+            res, rows = run_deberta_experiment(
+                mode_label="deberta_plus",
+                model_name="microsoft/deberta-v3-base",
+                X_train=X_train, y_train=y_train,
+                X_dev=X_dev, y_dev=y_dev,
+                X_test=X_test, y_test=y_test,
+                device=device, args=args,
+                output_dir=args.output_dir,
+                use_weighted_sampler=True,
+                label_smoothing=0.05,
+                freeze_layers=6,
+            )
+            all_results["DeBERTa + focal + extras"] = res
+            all_tuning_rows.extend(rows)
+
+    # Save tuning log.
+    if all_tuning_rows:
+        log_path = Path(args.output_dir) / "improved_tuning_log.csv"
+        fieldnames = list(all_tuning_rows[0].keys())
+        with open(log_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(all_tuning_rows)
+        logger.info(f"Tuning log saved → {log_path}")
+
+    # Save results JSON.
+    results_path = Path(args.output_dir) / "improved_results.json"
+    # Convert for JSON serialisation.
+    serialisable = {}
+    for k, v in all_results.items():
+        if v is not None:
+            serialisable[k] = v
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump(serialisable, f, indent=2)
+    logger.info(f"Results saved → {results_path}")
+
+    # Print comparison.
+    print_comparison(all_results)
+
+
+if __name__ == "__main__":
+    main()

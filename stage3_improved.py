@@ -261,19 +261,21 @@ class FocalLoss(nn.Module):
 # ---------------------------------------------------------------------------
 
 def train_epoch(model, loader, optimizer, scheduler, loss_fn, device,
-                grad_clip=1.0, scaler=None):
+                grad_clip=1.0, scaler=None, use_amp=False):
     model.train()
-    use_amp = scaler is not None and device.type == "cuda"
+    # When scaler is provided use fp16 (legacy path); otherwise use bf16 (no scaler needed).
+    _use_amp = (use_amp or scaler is not None) and device.type == "cuda"
+    _amp_dtype = torch.float16 if scaler is not None else torch.bfloat16
     total_loss = 0.0
     for batch in loader:
         ids = batch["input_ids"].to(device)
         mask = batch["attention_mask"].to(device)
         labels = batch["label"].to(device)
         optimizer.zero_grad()
-        with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+        with torch.amp.autocast(device_type="cuda", enabled=_use_amp, dtype=_amp_dtype):
             logits = model(input_ids=ids, attention_mask=mask).logits
             loss = loss_fn(logits, labels)
-        if use_amp:
+        if _use_amp and scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -540,9 +542,11 @@ def run_training_improved(
     )
     loss_fn = lambda logits, labels: _criterion(logits, labels)
 
-    # Mixed-precision scaler for DeBERTa numerical stability.
-    use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler(enabled=use_amp) if use_amp else None
+    # DeBERTa-v3 is incompatible with fp16 GradScaler (raises "Attempting to unscale
+    # FP16 gradients").  Use bfloat16 autocast instead — no GradScaler required.
+    # Fall back to plain fp32 if the GPU does not support bf16 (pre-Ampere).
+    use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    scaler = None  # bf16 autocast does not need gradient scaling
 
     best_dev_f1 = 0.0
     best_threshold = 0.5
@@ -554,7 +558,7 @@ def run_training_improved(
     for epoch in range(1, epochs + 1):
         t0 = time.time()
         train_loss = train_epoch(model, train_loader, optimizer, scheduler,
-                                 loss_fn, device, scaler=scaler)
+                                 loss_fn, device, scaler=scaler, use_amp=use_amp)
         dev_probs, dev_labels = get_probabilities(model, dev_loader, device,
                                                   use_amp=use_amp)
         threshold, dev_f1 = tune_threshold(dev_probs, dev_labels)

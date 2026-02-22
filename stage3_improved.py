@@ -261,33 +261,43 @@ class FocalLoss(nn.Module):
 # ---------------------------------------------------------------------------
 
 def train_epoch(model, loader, optimizer, scheduler, loss_fn, device,
-                grad_clip=1.0):
+                grad_clip=1.0, scaler=None):
     model.train()
+    use_amp = scaler is not None and device.type == "cuda"
     total_loss = 0.0
     for batch in loader:
         ids = batch["input_ids"].to(device)
         mask = batch["attention_mask"].to(device)
         labels = batch["label"].to(device)
         optimizer.zero_grad()
-        logits = model(input_ids=ids, attention_mask=mask).logits
-        loss = loss_fn(logits, labels)
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
+        with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+            logits = model(input_ids=ids, attention_mask=mask).logits
+            loss = loss_fn(logits, labels)
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
         scheduler.step()
         total_loss += loss.item()
     return total_loss / max(len(loader), 1)
 
 
 @torch.no_grad()
-def get_probabilities(model, loader, device):
+def get_probabilities(model, loader, device, use_amp=False):
     model.eval()
     all_probs, all_labels = [], []
     for batch in loader:
         ids = batch["input_ids"].to(device)
         mask = batch["attention_mask"].to(device)
-        logits = model(input_ids=ids, attention_mask=mask).logits
-        probs = F.softmax(logits, dim=-1)[:, 1].cpu().numpy()
+        with torch.amp.autocast(device_type="cuda", enabled=use_amp and device.type == "cuda"):
+            logits = model(input_ids=ids, attention_mask=mask).logits
+        probs = F.softmax(logits.float(), dim=-1)[:, 1].cpu().numpy()
         all_probs.extend(probs.tolist())
         all_labels.extend(batch["label"].numpy().tolist())
     return np.array(all_probs), np.array(all_labels)
@@ -530,6 +540,10 @@ def run_training_improved(
     )
     loss_fn = lambda logits, labels: _criterion(logits, labels)
 
+    # Mixed-precision scaler for DeBERTa numerical stability.
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler(enabled=use_amp) if use_amp else None
+
     best_dev_f1 = 0.0
     best_threshold = 0.5
     best_metrics = {}
@@ -540,8 +554,9 @@ def run_training_improved(
     for epoch in range(1, epochs + 1):
         t0 = time.time()
         train_loss = train_epoch(model, train_loader, optimizer, scheduler,
-                                 loss_fn, device)
-        dev_probs, dev_labels = get_probabilities(model, dev_loader, device)
+                                 loss_fn, device, scaler=scaler)
+        dev_probs, dev_labels = get_probabilities(model, dev_loader, device,
+                                                  use_amp=use_amp)
         threshold, dev_f1 = tune_threshold(dev_probs, dev_labels)
         metrics = evaluate_at_threshold(dev_probs, dev_labels, threshold)
         elapsed = time.time() - t0
@@ -691,7 +706,8 @@ def run_deberta_experiment(
     max_len = int(best_holder["params"].get("max_len", 256))
     test_ds = PCLDataset(X_test, y_test, tokenizer, max_len)
     test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=0)
-    test_probs, test_labels = get_probabilities(model, test_loader, device)
+    use_amp = device.type == "cuda"
+    test_probs, test_labels = get_probabilities(model, test_loader, device, use_amp=use_amp)
     test_metrics = evaluate_at_threshold(test_probs, test_labels, best_holder["threshold"])
 
     # Also check oracle test threshold.

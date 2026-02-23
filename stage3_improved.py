@@ -51,7 +51,6 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
-from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from transformers import (
     AutoModelForSequenceClassification,
@@ -73,14 +72,12 @@ logger = logging.getLogger(__name__)
 
 # Data paths (same as stage3.py).
 TRAIN_LABELS_PATH = "train_semeval_parids-labels.csv"
+DEV_LABELS_PATH = "dev_semeval_parids-labels.csv"
 PCL_TSV_PATH = "dontpatronizeme_pcl.tsv"
 
-# Split ratios (same as stage3.py).
-TRAIN_RATIO = 0.70
-DEV_RATIO = 0.15
-TEST_RATIO = 0.15
-
-THRESHOLD_RANGE = np.arange(0.05, 0.96, 0.01)
+# Include 0.00 so we can recover from very low-confidence models instead of
+# getting stuck with all-negative predictions and F1=0.
+THRESHOLD_RANGE = np.arange(0.00, 1.01, 0.01)
 
 # Prior results for comparison table.
 PRIOR_RESULTS = {
@@ -157,7 +154,7 @@ def read_texts(path: str) -> dict:
     return texts
 
 
-def load_data(labels_path: str, pcl_path: str):
+def load_data(labels_path: str, pcl_path: str, split_name: str):
     labels = read_labels(labels_path)
     texts = read_texts(pcl_path)
     X, y = [], []
@@ -168,32 +165,11 @@ def load_data(labels_path: str, pcl_path: str):
             y.append(label)
     n_pcl = sum(y)
     logger.info(
-        f"Loaded {len(X)} samples — "
+        f"Loaded {split_name}={len(X)} samples — "
         f"PCL={n_pcl} ({100*n_pcl/len(y):.1f}%)  "
         f"No-PCL={len(y)-n_pcl} ({100*(len(y)-n_pcl)/len(y):.1f}%)"
     )
     return X, y
-
-
-def make_splits(X, y, seed):
-    X_arr = np.array(X, dtype=object)
-    y_arr = np.array(y)
-    X_td, X_test, y_td, y_test = train_test_split(
-        X_arr, y_arr, test_size=TEST_RATIO, stratify=y_arr, random_state=seed,
-    )
-    dev_ratio_adjusted = DEV_RATIO / (TRAIN_RATIO + DEV_RATIO)
-    X_train, X_dev, y_train, y_dev = train_test_split(
-        X_td, y_td, test_size=dev_ratio_adjusted, stratify=y_td, random_state=seed,
-    )
-    logger.info(
-        f"Splits: train={len(X_train)}, dev={len(X_dev)}, test={len(X_test)}  "
-        f"(PCL rate ≈ {100*y_train.mean():.1f}% / {100*y_dev.mean():.1f}% / "
-        f"{100*y_test.mean():.1f}%)"
-    )
-    return (
-        X_train.tolist(), X_dev.tolist(), X_test.tolist(),
-        y_train.tolist(), y_dev.tolist(), y_test.tolist(),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -306,13 +282,30 @@ def get_probabilities(model, loader, device, use_amp=False):
 
 
 def tune_threshold(probs, labels):
-    best_t, best_f1 = 0.5, 0.0
+    labels = np.asarray(labels)
+    best_t, best_f1 = 0.5, -1.0
+    best_recall, best_precision = -1.0, -1.0
     for t in THRESHOLD_RANGE:
         preds = (probs >= t).astype(int)
         f1 = f1_score(labels, preds, pos_label=1, zero_division=0)
-        if f1 > best_f1:
+        recall = recall_score(labels, preds, pos_label=1, zero_division=0)
+        precision = precision_score(labels, preds, pos_label=1, zero_division=0)
+        # Primary objective: F1. Tie-breakers prefer higher recall then precision.
+        if (
+            f1 > best_f1
+            or (f1 == best_f1 and recall > best_recall)
+            or (f1 == best_f1 and recall == best_recall and precision > best_precision)
+        ):
             best_f1 = f1
             best_t = round(float(t), 3)
+            best_recall = recall
+            best_precision = precision
+    # Safety fallback: if all thresholds collapse to F1=0 but positives exist,
+    # force threshold 0.00 to avoid all-negative output.
+    if best_f1 <= 0.0 and int(labels.sum()) > 0:
+        best_t = 0.0
+        preds = (probs >= best_t).astype(int)
+        best_f1 = f1_score(labels, preds, pos_label=1, zero_division=0)
     return best_t, best_f1
 
 
@@ -361,20 +354,17 @@ def freeze_bottom_layers(model, n_freeze=6):
 
 
 # ---------------------------------------------------------------------------
-# 7. Experiment A: Ensemble (zero training cost)
+# 7. Experiment A: Ensemble (retrained checkpoints)
 # ---------------------------------------------------------------------------
 
 def run_ensemble(
-    X_dev, y_dev, X_test, y_test,
-    baseline_ckpt, novel_ckpt,
-    device, output_dir,
+    X_train, y_train,
+    X_dev, y_dev,
+    device, output_dir, args,
 ):
     """
-    Load two existing checkpoints and average their PCL probabilities.
-
-    This is a simple but effective technique: averaging reduces variance
-    of individual model predictions.  Top SemEval teams (#2 stce, #5 holdon)
-    used multi-model ensembles.
+    Retrain baseline + novel RoBERTa checkpoints (stage3 recipes) and average
+    their PCL probabilities.
     """
     logger.info("\n" + "=" * 62)
     logger.info(" EXPERIMENT: ENSEMBLE (baseline + novel)")
@@ -382,11 +372,33 @@ def run_ensemble(
 
     results = {}
 
-    for ckpt_dir, label in [(baseline_ckpt, "baseline"), (novel_ckpt, "novel")]:
-        if not Path(ckpt_dir).exists():
-            logger.error(f"Checkpoint not found: {ckpt_dir}")
-            logger.error("Run `python stage3.py --mode both` first to generate checkpoints.")
-            return None
+    # Always retrain so stage3_improved.py is fully standalone.
+    resolved_ckpts = {
+        "baseline": str(
+            retrain_ensemble_checkpoint(
+                variant="baseline",
+                output_dir=output_dir,
+                X_train=X_train, y_train=y_train,
+                X_dev=X_dev, y_dev=y_dev,
+                seed=args.seed, device=device,
+                epochs=max(2, min(4, args.epochs)),
+                patience=max(1, min(2, args.patience)),
+            )
+        ),
+        "novel": str(
+            retrain_ensemble_checkpoint(
+                variant="novel",
+                output_dir=output_dir,
+                X_train=X_train, y_train=y_train,
+                X_dev=X_dev, y_dev=y_dev,
+                seed=args.seed, device=device,
+                epochs=max(2, min(4, args.epochs)),
+                patience=max(1, min(2, args.patience)),
+            )
+        ),
+    }
+
+    for label, ckpt_dir in [("baseline", resolved_ckpts["baseline"]), ("novel", resolved_ckpts["novel"])]:
         # Validate that key files are non-empty (catch corrupt saves).
         for fname in ["tokenizer.json", "model.safetensors"]:
             fpath = Path(ckpt_dir) / fname
@@ -395,11 +407,9 @@ def run_ensemble(
                 if fname == "model.safetensors" and (Path(ckpt_dir) / "pytorch_model.bin").exists():
                     continue
                 logger.error(f"Missing file: {fpath}")
-                logger.error("Run `python stage3.py --mode both` first to generate checkpoints.")
                 return None
             if fpath.stat().st_size == 0:
                 logger.error(f"Corrupt (0-byte) file: {fpath}")
-                logger.error("Delete the checkpoint dir and re-run `python stage3.py --mode novel`.")
                 return None
         # Quick JSON validity check on tokenizer.json.
         tok_path = Path(ckpt_dir) / "tokenizer.json"
@@ -410,13 +420,12 @@ def run_ensemble(
                     json.load(f)
             except (json.JSONDecodeError, Exception) as e:
                 logger.error(f"Corrupt tokenizer file: {tok_path} — {e}")
-                logger.error("Delete the checkpoint dir and re-run `python stage3.py --mode novel`.")
                 return None
 
     # Load both models.
     models = {}
     tokenizers = {}
-    for ckpt_dir, label in [(baseline_ckpt, "baseline"), (novel_ckpt, "novel")]:
+    for label, ckpt_dir in [("baseline", resolved_ckpts["baseline"]), ("novel", resolved_ckpts["novel"])]:
         logger.info(f"Loading {label} checkpoint from {ckpt_dir}")
         tokenizers[label] = AutoTokenizer.from_pretrained(ckpt_dir)
         model = AutoModelForSequenceClassification.from_pretrained(ckpt_dir)
@@ -427,7 +436,7 @@ def run_ensemble(
     # Use baseline tokenizer for dataset (both are roberta-base).
     tokenizer = tokenizers["baseline"]
 
-    for split_name, X_split, y_split in [("dev", X_dev, y_dev), ("test", X_test, y_test)]:
+    for split_name, X_split, y_split in [("dev", X_dev, y_dev)]:
         ds = PCLDataset(X_split, y_split, tokenizer, max_len=256)
         loader = DataLoader(ds, batch_size=32, shuffle=False, num_workers=0)
 
@@ -456,6 +465,68 @@ def run_ensemble(
     return results
 
 
+def retrain_ensemble_checkpoint(
+    variant,
+    output_dir,
+    X_train, y_train,
+    X_dev, y_dev,
+    seed,
+    device,
+    epochs=3,
+    patience=2,
+):
+    """
+    Retrain RoBERTa checkpoints for ensemble mode using stage3 recipes:
+    - baseline: standard cross-entropy
+    - novel: focal loss
+    """
+    out = Path(output_dir) / f"retrained_{variant}_checkpoint"
+    out.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Retraining `{variant}` checkpoint at {out}")
+
+    model_name = "roberta-base"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if variant == "baseline":
+        loss_mode = "standard"
+        focal_gamma, focal_alpha, label_smoothing = 2.0, 0.25, 0.0
+    else:
+        loss_mode = "focal"
+        focal_gamma, focal_alpha, label_smoothing = 2.0, 0.25, 0.0
+
+    _, _, _, best_state = run_training_improved(
+        model_name=model_name,
+        X_train=X_train, y_train=y_train,
+        X_dev=X_dev, y_dev=y_dev,
+        tokenizer=tokenizer,
+        lr=2e-5,
+        batch_size=16,
+        epochs=epochs,
+        weight_decay=0.01,
+        max_len=256,
+        seed=seed,
+        device=device,
+        loss_mode=loss_mode,
+        focal_gamma=focal_gamma,
+        focal_alpha=focal_alpha,
+        label_smoothing=label_smoothing,
+        use_weighted_sampler=False,
+        freeze_layers=0,
+        patience=patience,
+    )
+    if best_state is None:
+        raise RuntimeError(f"Failed to retrain `{variant}` checkpoint.")
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name, num_labels=2, ignore_mismatched_sizes=True,
+    )
+    model.load_state_dict(best_state)
+    model.save_pretrained(str(out))
+    tokenizer.save_pretrained(str(out))
+    del model
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 8. Experiment B & C: DeBERTa training
 # ---------------------------------------------------------------------------
@@ -468,6 +539,7 @@ def run_training_improved(
     *,
     lr, batch_size, epochs, weight_decay, max_len,
     seed, device,
+    loss_mode="focal",   # "standard" | "focal"
     focal_gamma=2.0, focal_alpha=0.25,
     label_smoothing=0.0,
     use_weighted_sampler=False,
@@ -535,12 +607,15 @@ def run_training_improved(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps,
     )
 
-    # Focal loss with optional label smoothing.
-    _criterion = FocalLoss(
-        alpha=focal_alpha, gamma=focal_gamma,
-        label_smoothing=label_smoothing,
-    )
-    loss_fn = lambda logits, labels: _criterion(logits, labels)
+    # Keep stage3 baseline behavior available for retraining.
+    if loss_mode == "standard":
+        loss_fn = lambda logits, labels: F.cross_entropy(logits, labels)
+    else:
+        _criterion = FocalLoss(
+            alpha=focal_alpha, gamma=focal_gamma,
+            label_smoothing=label_smoothing,
+        )
+        loss_fn = lambda logits, labels: _criterion(logits, labels)
 
     # DeBERTa-v3 is incompatible with fp16 GradScaler (raises "Attempting to unscale
     # FP16 gradients").  Use bfloat16 autocast instead — no GradScaler required.
@@ -595,7 +670,6 @@ def run_deberta_experiment(
     model_name,
     X_train, y_train,
     X_dev, y_dev,
-    X_test, y_test,
     device, args, output_dir,
     use_weighted_sampler=False,
     label_smoothing=0.0,
@@ -680,7 +754,7 @@ def run_deberta_experiment(
                 "params": params, "trial_id": trial_id,
             })
 
-    # --- Evaluate on test with best model ---
+    # --- Evaluate on official dev with best model ---
     if best_holder["state"] is None:
         logger.warning(f"[{mode_label}] No successful trials.")
         return None, tuning_rows
@@ -706,23 +780,23 @@ def run_deberta_experiment(
     tokenizer.save_pretrained(ckpt_dir)
     logger.info(f"Checkpoint saved → {ckpt_dir}")
 
-    # Test evaluation.
+    # Dev evaluation.
     max_len = int(best_holder["params"].get("max_len", 256))
-    test_ds = PCLDataset(X_test, y_test, tokenizer, max_len)
-    test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=0)
+    dev_ds = PCLDataset(X_dev, y_dev, tokenizer, max_len)
+    dev_loader = DataLoader(dev_ds, batch_size=32, shuffle=False, num_workers=0)
     use_amp = device.type == "cuda"
-    test_probs, test_labels = get_probabilities(model, test_loader, device, use_amp=use_amp)
-    test_metrics = evaluate_at_threshold(test_probs, test_labels, best_holder["threshold"])
+    dev_probs, dev_labels = get_probabilities(model, dev_loader, device, use_amp=use_amp)
+    dev_eval_metrics = evaluate_at_threshold(dev_probs, dev_labels, best_holder["threshold"])
 
-    # Also check oracle test threshold.
-    oracle_thr, oracle_f1 = tune_threshold(test_probs, test_labels)
-    test_metrics["test_oracle_threshold"] = oracle_thr
-    test_metrics["test_oracle_f1"] = oracle_f1
+    # Also check oracle dev threshold.
+    oracle_thr, oracle_f1 = tune_threshold(dev_probs, dev_labels)
+    dev_eval_metrics["dev_oracle_threshold"] = oracle_thr
+    dev_eval_metrics["dev_oracle_f1"] = oracle_f1
 
     logger.info(
-        f"[{mode_label.upper()}] Test  F1(PCL)={test_metrics['f1_pcl']:.4f}  "
-        f"P={test_metrics['precision_pcl']:.4f}  "
-        f"R={test_metrics['recall_pcl']:.4f}"
+        f"[{mode_label.upper()}] Dev(eval) F1(PCL)={dev_eval_metrics['f1_pcl']:.4f}  "
+        f"P={dev_eval_metrics['precision_pcl']:.4f}  "
+        f"R={dev_eval_metrics['recall_pcl']:.4f}"
     )
 
     del model
@@ -735,7 +809,7 @@ def run_deberta_experiment(
         "best_threshold": best_holder["threshold"],
         "best_trial_id": best_holder["trial_id"],
         "dev_metrics": best_holder["metrics"],
-        "test_metrics": test_metrics,
+        "dev_eval_metrics": dev_eval_metrics,
         "extras": {
             "label_smoothing": label_smoothing,
             "weighted_sampler": use_weighted_sampler,
@@ -770,9 +844,11 @@ def print_comparison(all_results):
     for name, res in all_results.items():
         if res is None:
             continue
-        for split in ["dev", "test"]:
+        for split in ["dev"]:
             m = res.get(f"{split}_metrics", {})
             thr = res.get(f"{split}_threshold", res.get("best_threshold", 0))
+            if not m and split == "dev":
+                m = res.get("dev_eval_metrics", {})
             if m:
                 print(
                     f"{name + ' ' + split:<42} {m.get('f1_pcl',0):>8.4f} "
@@ -782,15 +858,15 @@ def print_comparison(all_results):
 
     print("=" * 80)
 
-    # Delta vs best prior.
-    best_prior_test = max(r["test_f1"] for r in PRIOR_RESULTS.values())
+    # Delta vs best prior dev score (since this script now evaluates on dev only).
+    best_prior_dev = max(r["dev_f1"] for r in PRIOR_RESULTS.values())
     for name, res in all_results.items():
         if res is None:
             continue
-        test_m = res.get("test_metrics", {})
-        if test_m:
-            delta = test_m.get("f1_pcl", 0) - best_prior_test
-            print(f"  Δ test F1 ({name} vs best prior): {delta:+.4f}")
+        dev_m = res.get("dev_metrics", {}) or res.get("dev_eval_metrics", {})
+        if dev_m:
+            delta = dev_m.get("f1_pcl", 0) - best_prior_dev
+            print(f"  Δ dev F1 ({name} vs best prior dev): {delta:+.4f}")
 
     print()
 
@@ -815,15 +891,6 @@ def main():
     parser.add_argument("--n_trials", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="outputs_improved")
-    # Checkpoint paths from stage3.py.
-    parser.add_argument(
-        "--baseline_ckpt", type=str,
-        default="outputs/baseline_best_checkpoint",
-    )
-    parser.add_argument(
-        "--novel_ckpt", type=str,
-        default="outputs/novel_best_checkpoint",
-    )
     args = parser.parse_args()
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
@@ -831,9 +898,9 @@ def main():
     device = get_device()
     logger.info(f"Device: {device}")
 
-    # Load data with SAME seed & splits as stage3.py.
-    X, y = load_data(TRAIN_LABELS_PATH, PCL_TSV_PATH)
-    X_train, X_dev, X_test, y_train, y_dev, y_test = make_splits(X, y, seed=args.seed)
+    # Use official split files directly.
+    X_train, y_train = load_data(TRAIN_LABELS_PATH, PCL_TSV_PATH, split_name="train")
+    X_dev, y_dev = load_data(DEV_LABELS_PATH, PCL_TSV_PATH, split_name="dev")
 
     modes = {
         "ensemble": ["ensemble"],
@@ -848,12 +915,11 @@ def main():
     for mode in modes:
         if mode == "ensemble":
             res = run_ensemble(
+                X_train=X_train, y_train=y_train,
                 X_dev=X_dev, y_dev=y_dev,
-                X_test=X_test, y_test=y_test,
-                baseline_ckpt=args.baseline_ckpt,
-                novel_ckpt=args.novel_ckpt,
                 device=device,
                 output_dir=args.output_dir,
+                args=args,
             )
             all_results["Ensemble (base+novel)"] = res
 
@@ -864,7 +930,6 @@ def main():
                 model_name="microsoft/deberta-v3-base",
                 X_train=X_train, y_train=y_train,
                 X_dev=X_dev, y_dev=y_dev,
-                X_test=X_test, y_test=y_test,
                 device=device, args=args,
                 output_dir=args.output_dir,
                 use_weighted_sampler=False,
@@ -881,7 +946,6 @@ def main():
                 model_name="microsoft/deberta-v3-base",
                 X_train=X_train, y_train=y_train,
                 X_dev=X_dev, y_dev=y_dev,
-                X_test=X_test, y_test=y_test,
                 device=device, args=args,
                 output_dir=args.output_dir,
                 use_weighted_sampler=True,

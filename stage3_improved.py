@@ -142,14 +142,20 @@ def read_labels(path: str) -> dict:
     return labels
 
 
-def read_texts(path: str) -> dict:
+def read_texts(path: str, min_cols: int = 5, skip_lines: int = 4) -> dict:
+    """
+    Read par_id → text from a TSV file.
+    skip_lines=4  for dontpatronizeme_pcl.tsv (4-line disclaimer header).
+    skip_lines=0  for the hidden test TSV (data starts at line 1, no header).
+    min_cols=5    accepts files without a label column.
+    """
     texts = {}
     with open(path, mode="r", encoding="utf-8") as f:
         for i, line in enumerate(f):
-            if i < 4:
+            if i < skip_lines:
                 continue
             parts = line.strip().split("\t")
-            if len(parts) >= 6:
+            if len(parts) >= min_cols:
                 texts[parts[0]] = parts[4]
     return texts
 
@@ -471,7 +477,7 @@ def run_ensemble(
         # Average probs.
         probs_avg = (probs_b + probs_n) / 2.0
 
-        thr, f1 = tune_threshold(probs_avg, labels)
+        thr, _ = tune_threshold(probs_avg, labels)
         metrics = evaluate_at_threshold(probs_avg, labels, thr)
 
         logger.info(
@@ -514,8 +520,12 @@ def retrain_ensemble_checkpoint(
         loss_mode = "standard"
         focal_gamma, focal_alpha, label_smoothing = 2.0, 0.25, 0.0
     else:
+        # alpha=0.75 upweights the minority PCL class (9.5% positive rate).
+        # This gives the novel member higher recall vs the baseline's higher
+        # precision — creating the complementary diversity that makes ensembling
+        # worthwhile. alpha=0.25 (original) would make both members conservative.
         loss_mode = "focal"
-        focal_gamma, focal_alpha, label_smoothing = 2.0, 0.25, 0.0
+        focal_gamma, focal_alpha, label_smoothing = 2.0, 0.75, 0.0
 
     _, _, _, best_state = run_training_improved(
         model_name=model_name,
@@ -659,7 +669,7 @@ def run_training_improved(
     use_amp = False
     scaler = None  # bf16 autocast does not need gradient scaling
 
-    best_dev_f1 = 0.0
+    best_dev_f1 = -1.0   # -1 so even F1=0.0 on epoch 1 triggers a save
     best_threshold = 0.5
     best_metrics = {}
     best_state = None
@@ -678,7 +688,7 @@ def run_training_improved(
         if not np.isfinite(dev_probs).all():
             logger.warning("    Non-finite dev probabilities. Stopping this trial early.")
             break
-        threshold, dev_f1 = tune_threshold(dev_probs, dev_labels)
+        threshold, _ = tune_threshold(dev_probs, dev_labels)
         metrics = evaluate_at_threshold(dev_probs, dev_labels, threshold)
         elapsed = time.time() - t0
 
@@ -738,15 +748,17 @@ def run_deberta_experiment(
 
     rng = np.random.RandomState(args.seed)
     for trial_id in range(args.n_trials):
-        # Conservative search space for stability on CUDA.
+        # PCL is ~9.5% of data, so alpha must upweight the positive class.
+        # alpha=0.25 was wrong (downweights minority); correct range is 0.65–0.85.
+        # Batch size 4 causes noisy gradients and NaN loss; minimum is now 8.
         params = {
-            "lr": float(np.exp(rng.uniform(np.log(5e-6), np.log(2e-5)))),
-            "batch_size": int(rng.choice([4, 8])),
+            "lr": float(np.exp(rng.uniform(np.log(8e-6), np.log(3e-5)))),
+            "batch_size": int(rng.choice([8, 16])),
             "epochs": int(rng.randint(min(2, args.epochs), args.epochs + 1)),
             "weight_decay": float(rng.uniform(0.0, 0.05)),
             "max_len": int(rng.choice([128, 256])),
             "focal_gamma": float(rng.uniform(0.5, 2.0)),
-            "focal_alpha": float(rng.uniform(0.25, 0.65)),
+            "focal_alpha": float(rng.uniform(0.65, 0.85)),
         }
 
         logger.info(
@@ -915,7 +927,116 @@ def print_comparison(all_results):
 
 
 # ---------------------------------------------------------------------------
-# 10. Main
+# 10. Ensemble predict (for hidden-label test set submission)
+# ---------------------------------------------------------------------------
+
+def run_predict(args, device):
+    """
+    Load all saved checkpoints from --output_dir, average their PCL
+    probabilities, tune the decision threshold on the official dev set,
+    and write predictions for the test file to test_predictions.csv.
+
+    Usage:
+        python stage3_improved.py --mode predict --test_file /path/to/test.tsv
+    """
+    output_dir = Path(args.output_dir)
+
+    # Checkpoints saved by each experiment, in priority order.
+    candidate_names = [
+        "deberta_focal_best_checkpoint",
+        "deberta_plus_best_checkpoint",
+        "retrained_novel_checkpoint",
+        "retrained_baseline_checkpoint",
+    ]
+    checkpoint_dirs = []
+    for name in candidate_names:
+        ckpt = output_dir / name
+        if ckpt.exists() and (ckpt / "tokenizer.json").exists():
+            checkpoint_dirs.append(ckpt)
+            logger.info(f"  Found checkpoint: {name}")
+
+    if not checkpoint_dirs:
+        logger.error(
+            f"No checkpoints found in {output_dir}. "
+            "Run training first (--mode all or individual modes)."
+        )
+        return
+
+    logger.info(f"Ensemble size: {len(checkpoint_dirs)} model(s)")
+
+    # Load dev set for threshold tuning.
+    X_dev, y_dev = load_data(DEV_LABELS_PATH, PCL_TSV_PATH, split_name="dev")
+    y_dev_arr = np.array(y_dev)
+
+    # Load test set — no 4-line header, no label column.
+    test_texts = read_texts(args.test_file, min_cols=5, skip_lines=0)
+    if not test_texts:
+        logger.error(f"No texts loaded from {args.test_file}. Check file format.")
+        return
+    par_ids = list(test_texts.keys())
+    X_test = [test_texts[pid] for pid in par_ids]
+    y_test_dummy = [0] * len(X_test)
+    logger.info(f"Test set: {len(X_test)} paragraphs")
+
+    all_dev_probs, all_test_probs = [], []
+
+    for ckpt_dir in checkpoint_dirs:
+        logger.info(f"Inferring with {ckpt_dir.name} ...")
+        tokenizer = AutoTokenizer.from_pretrained(str(ckpt_dir))
+        model_kwargs = {"num_labels": 2, "ignore_mismatched_sizes": True}
+        if "deberta" in ckpt_dir.name.lower():
+            model_kwargs["attn_implementation"] = "eager"
+        model = AutoModelForSequenceClassification.from_pretrained(
+            str(ckpt_dir), **model_kwargs
+        )
+        model.to(device).eval()
+
+        max_len = 256  # safe default; all checkpoints were trained with ≤256
+
+        dev_ds = PCLDataset(X_dev, y_dev, tokenizer, max_len)
+        dev_loader = DataLoader(dev_ds, batch_size=32, shuffle=False, num_workers=0)
+        dev_probs, _ = get_probabilities(model, dev_loader, device)
+        all_dev_probs.append(dev_probs)
+
+        test_ds = PCLDataset(X_test, y_test_dummy, tokenizer, max_len)
+        test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=0)
+        test_probs, _ = get_probabilities(model, test_loader, device)
+        all_test_probs.append(test_probs)
+
+        del model
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # Average probabilities across all models.
+    ens_dev_probs = np.mean(all_dev_probs, axis=0)
+    ens_test_probs = np.mean(all_test_probs, axis=0)
+
+    # Tune threshold on ensemble dev probabilities.
+    threshold, _ = tune_threshold(ens_dev_probs, y_dev_arr)
+    dev_metrics = evaluate_at_threshold(ens_dev_probs, y_dev_arr, threshold)
+    logger.info(
+        f"Ensemble dev  F1={dev_metrics['f1_pcl']:.4f}  "
+        f"P={dev_metrics['precision_pcl']:.4f}  "
+        f"R={dev_metrics['recall_pcl']:.4f}  thr={threshold:.3f}"
+    )
+
+    # Apply threshold → binary predictions.
+    test_preds = (ens_test_probs >= threshold).astype(int)
+    n_pcl = int(test_preds.sum())
+    logger.info(f"Test predictions: {n_pcl} PCL, {len(test_preds)-n_pcl} No-PCL "
+                f"({100*n_pcl/len(test_preds):.1f}%)")
+
+    # Save CSV: par_id, prediction, pcl_probability
+    pred_path = output_dir / "test_predictions.csv"
+    with open(pred_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["par_id", "prediction", "pcl_probability"])
+        for pid, pred, prob in zip(par_ids, test_preds, ens_test_probs):
+            writer.writerow([pid, int(pred), f"{prob:.6f}"])
+    logger.info(f"Predictions saved → {pred_path}")
+
+
+# ---------------------------------------------------------------------------
+# 11. Main
 # ---------------------------------------------------------------------------
 
 def main():
@@ -925,9 +1046,15 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["ensemble", "deberta", "deberta_plus", "all"],
+        choices=["ensemble", "deberta", "deberta_plus", "all", "predict"],
         default="all",
-        help="Which experiment(s) to run.",
+        help="Which experiment(s) to run. Use 'predict' to generate test predictions.",
+    )
+    parser.add_argument(
+        "--test_file",
+        type=str,
+        default=None,
+        help="Path to test TSV (required for --mode predict). Labels not needed.",
     )
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--patience", type=int, default=3)
@@ -937,9 +1064,16 @@ def main():
     args = parser.parse_args()
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    versions = log_versions()
+    log_versions()
     device = get_device()
     logger.info(f"Device: {device}")
+
+    if args.mode == "predict":
+        if args.test_file is None:
+            print("ERROR: --test_file is required for --mode predict")
+            sys.exit(1)
+        run_predict(args, device)
+        return
 
     # Use official split files directly.
     X_train, y_train = load_data(TRAIN_LABELS_PATH, PCL_TSV_PATH, split_name="train")

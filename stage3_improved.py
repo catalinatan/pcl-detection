@@ -250,7 +250,13 @@ def train_epoch(model, loader, optimizer, scheduler, loss_fn, device,
         optimizer.zero_grad()
         with torch.amp.autocast(device_type="cuda", enabled=_use_amp, dtype=_amp_dtype):
             logits = model(input_ids=ids, attention_mask=mask).logits
+            if not torch.isfinite(logits).all():
+                logger.warning("    Non-finite logits detected; aborting epoch.")
+                return float("nan")
             loss = loss_fn(logits, labels)
+            if not torch.isfinite(loss):
+                logger.warning("    Non-finite loss detected; aborting epoch.")
+                return float("nan")
         if _use_amp and scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -617,10 +623,9 @@ def run_training_improved(
         )
         loss_fn = lambda logits, labels: _criterion(logits, labels)
 
-    # DeBERTa-v3 is incompatible with fp16 GradScaler (raises "Attempting to unscale
-    # FP16 gradients").  Use bfloat16 autocast instead — no GradScaler required.
-    # Fall back to plain fp32 if the GPU does not support bf16 (pre-Ampere).
-    use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    # Keep training in full precision for stability. In practice, bf16 autocast
+    # can still produce non-finite loss with some DeBERTa/hyperparameter combos.
+    use_amp = False
     scaler = None  # bf16 autocast does not need gradient scaling
 
     best_dev_f1 = 0.0
@@ -634,8 +639,14 @@ def run_training_improved(
         t0 = time.time()
         train_loss = train_epoch(model, train_loader, optimizer, scheduler,
                                  loss_fn, device, scaler=scaler, use_amp=use_amp)
+        if not np.isfinite(train_loss):
+            logger.warning("    Training diverged (non-finite loss). Stopping this trial early.")
+            break
         dev_probs, dev_labels = get_probabilities(model, dev_loader, device,
                                                   use_amp=use_amp)
+        if not np.isfinite(dev_probs).all():
+            logger.warning("    Non-finite dev probabilities. Stopping this trial early.")
+            break
         threshold, dev_f1 = tune_threshold(dev_probs, dev_labels)
         metrics = evaluate_at_threshold(dev_probs, dev_labels, threshold)
         elapsed = time.time() - t0

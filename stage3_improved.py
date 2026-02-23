@@ -18,10 +18,10 @@ fair comparison.
 
 Usage:
     python stage3_improved.py --mode ensemble
-    python stage3_improved.py --mode deberta --n_trials 5 --epochs 5
-    python stage3_improved.py --mode deberta_plus --n_trials 5 --epochs 5
-    python stage3_improved.py --mode all --n_trials 5 --epochs 5
-    python stage3_improved.py --mode all --n_trials 2 --epochs 2          # smoke-test
+    python stage3_improved.py --mode deberta --n_trials 5
+    python stage3_improved.py --mode deberta_plus --n_trials 5
+    python stage3_improved.py --mode all --n_trials 5
+    python stage3_improved.py --mode all --n_trials 2 --epochs 3 --patience 2   # smoke-test
 
 Outputs → outputs_improved/
 """
@@ -578,7 +578,7 @@ def run_training_improved(
     label_smoothing=0.0,
     use_weighted_sampler=False,
     freeze_layers=0,
-    patience=3,
+    patience=5,
 ):
     """
     Enhanced training loop with support for:
@@ -649,7 +649,7 @@ def run_training_improved(
     )
 
     total_steps = len(train_loader) * epochs
-    warmup_steps = max(1, int(0.15 * total_steps))
+    warmup_steps = max(1, int(0.06 * total_steps))
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps,
     )
@@ -670,6 +670,7 @@ def run_training_improved(
     scaler = None  # bf16 autocast does not need gradient scaling
 
     best_dev_f1 = -1.0   # -1 so even F1=0.0 on epoch 1 triggers a save
+    best_train_loss = float("inf")  # tie-break: prefer lower loss when F1 is equal
     best_threshold = 0.5
     best_metrics = {}
     best_state = None
@@ -698,13 +699,30 @@ def run_training_improved(
             f"P={metrics['precision_pcl']:.4f}  R={metrics['recall_pcl']:.4f}  "
             f"thr={threshold:.2f}  ({elapsed:.0f}s)"
         )
+        # Probability distribution: std≈0 means uniform output (model not discriminating yet).
+        # Growing std across epochs means the model is developing. Expected: ≥0.10 when healthy.
+        logger.info(
+            f"    prob_stats: mean={dev_probs.mean():.3f}  std={dev_probs.std():.4f}  "
+            f"min={dev_probs.min():.3f}  max={dev_probs.max():.3f}"
+        )
 
-        if metrics["f1_pcl"] > best_dev_f1:
+        f1_improved = metrics["f1_pcl"] > best_dev_f1
+        # Tie-break: if F1 is equal, prefer the epoch with lower training loss.
+        # This ensures we save the most-trained weights, not just epoch 1's weights,
+        # when the model is still developing discriminative probabilities.
+        loss_tiebreak = (
+            metrics["f1_pcl"] == best_dev_f1
+            and np.isfinite(train_loss)
+            and train_loss < best_train_loss
+        )
+        if f1_improved or loss_tiebreak:
             best_dev_f1 = metrics["f1_pcl"]
+            best_train_loss = train_loss
             best_threshold = threshold
             best_metrics = metrics
             best_epoch = epoch
-            no_improve = 0
+            if f1_improved:
+                no_improve = 0
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         else:
             no_improve += 1
@@ -751,8 +769,9 @@ def run_deberta_experiment(
         # PCL is ~9.5% of data, so alpha must upweight the positive class.
         # alpha=0.25 was wrong (downweights minority); correct range is 0.65–0.85.
         # Batch size 4 causes noisy gradients and NaN loss; minimum is now 8.
+        # LR range 1e-5–5e-5: DeBERTa-v3-base commonly fine-tuned at this range.
         params = {
-            "lr": float(np.exp(rng.uniform(np.log(8e-6), np.log(3e-5)))),
+            "lr": float(np.exp(rng.uniform(np.log(1e-5), np.log(5e-5)))),
             "batch_size": int(rng.choice([8, 16])),
             "epochs": int(rng.randint(min(2, args.epochs), args.epochs + 1)),
             "weight_decay": float(rng.uniform(0.0, 0.05)),
@@ -1056,8 +1075,8 @@ def main():
         default=None,
         help="Path to test TSV (required for --mode predict). Labels not needed.",
     )
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--patience", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--n_trials", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="outputs_improved")
@@ -1101,7 +1120,10 @@ def main():
             all_results["Ensemble (base+novel)"] = res
 
         elif mode == "deberta":
-            # DeBERTa-v3-base + focal loss (same recipe as novel but better encoder).
+            # DeBERTa-v3-base + focal loss + weighted sampler.
+            # Weighted sampler ensures ~50/50 PCL/No-PCL batches, which is critical
+            # given the 9.5% class imbalance — otherwise batches of 16 average only
+            # ~1-2 positive examples and the gradient is dominated by negatives.
             res, rows = run_deberta_experiment(
                 mode_label="deberta_focal",
                 model_name="microsoft/deberta-v3-base",
@@ -1109,7 +1131,7 @@ def main():
                 X_dev=X_dev, y_dev=y_dev,
                 device=device, args=args,
                 output_dir=args.output_dir,
-                use_weighted_sampler=False,
+                use_weighted_sampler=True,
                 label_smoothing=0.0,
                 freeze_layers=0,
             )

@@ -8,10 +8,8 @@ Builds on stage3.py results:
 
 New experiments:
     1. ensemble    — Average probs from baseline + novel checkpoints (zero cost)
-    2. deberta     — DeBERTa-v3-base + focal loss (expected biggest gain)
-    3. deberta_plus — DeBERTa-v3-base + focal + weighted sampler + label smoothing
-                      + freeze bottom layers (kitchen sink)
-    4. all         — Run all of the above sequentially
+    2. deberta     — DeBERTa-v3-base + focal loss
+    3. all         — Run all of the above sequentially
 
 Uses identical data splits (same seed=42, 70/15/15) as stage3.py for
 fair comparison.
@@ -19,7 +17,6 @@ fair comparison.
 Usage:
     python stage3_improved.py --mode ensemble
     python stage3_improved.py --mode deberta --n_trials 5
-    python stage3_improved.py --mode deberta_plus --n_trials 5
     python stage3_improved.py --mode all --n_trials 5
     python stage3_improved.py --mode all --n_trials 2 --epochs 3 --patience 2   # smoke-test
 
@@ -1065,7 +1062,7 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["ensemble", "deberta", "deberta_plus", "all", "predict"],
+        choices=["ensemble", "deberta", "all", "predict"],
         default="all",
         help="Which experiment(s) to run. Use 'predict' to generate test predictions.",
     )
@@ -1101,8 +1098,7 @@ def main():
     modes = {
         "ensemble": ["ensemble"],
         "deberta": ["deberta"],
-        "deberta_plus": ["deberta_plus"],
-        "all": ["ensemble", "deberta", "deberta_plus"],
+        "all": ["ensemble", "deberta"],
     }[args.mode]
 
     all_results = {}
@@ -1120,10 +1116,12 @@ def main():
             all_results["Ensemble (base+novel)"] = res
 
         elif mode == "deberta":
-            # DeBERTa-v3-base + focal loss + weighted sampler.
-            # Weighted sampler ensures ~50/50 PCL/No-PCL batches, which is critical
-            # given the 9.5% class imbalance — otherwise batches of 16 average only
-            # ~1-2 positive examples and the gradient is dominated by negatives.
+            # DeBERTa-v3-base + focal loss only (no weighted sampler).
+            # Focal loss with alpha=0.65–0.85 is the single mechanism for class
+            # imbalance. Combining it with weighted sampler (pos_w≈5x) creates
+            # ~10x total over-emphasis on positives → classifier weights collapse
+            # → std=0.000 on dev (model becomes completely input-blind).
+            # Use focal loss alone; sampler is reserved for deberta_plus.
             res, rows = run_deberta_experiment(
                 mode_label="deberta_focal",
                 model_name="microsoft/deberta-v3-base",
@@ -1131,27 +1129,11 @@ def main():
                 X_dev=X_dev, y_dev=y_dev,
                 device=device, args=args,
                 output_dir=args.output_dir,
-                use_weighted_sampler=True,
+                use_weighted_sampler=False,
                 label_smoothing=0.0,
                 freeze_layers=0,
             )
             all_results["DeBERTa + focal"] = res
-            all_tuning_rows.extend(rows)
-
-        elif mode == "deberta_plus":
-            # DeBERTa + focal + weighted sampler + label smoothing + freeze bottom 6 layers.
-            res, rows = run_deberta_experiment(
-                mode_label="deberta_plus",
-                model_name="microsoft/deberta-v3-base",
-                X_train=X_train, y_train=y_train,
-                X_dev=X_dev, y_dev=y_dev,
-                device=device, args=args,
-                output_dir=args.output_dir,
-                use_weighted_sampler=True,
-                label_smoothing=0.05,
-                freeze_layers=6,
-            )
-            all_results["DeBERTa + focal + extras"] = res
             all_tuning_rows.extend(rows)
 
     # Save tuning log.

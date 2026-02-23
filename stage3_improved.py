@@ -594,8 +594,16 @@ def run_training_improved(
         num_workers=0, pin_memory=pin,
     )
 
+    # Prefer eager attention for DeBERTa on CUDA to avoid occasional non-finite
+    # logits with newer torch/transformers kernel combinations.
+    model_kwargs = {
+        "num_labels": 2,
+        "ignore_mismatched_sizes": True,
+    }
+    if "deberta" in model_name.lower():
+        model_kwargs["attn_implementation"] = "eager"
     model = AutoModelForSequenceClassification.from_pretrained(
-        model_name, num_labels=2, ignore_mismatched_sizes=True,
+        model_name, **model_kwargs
     )
     model.to(device)
 
@@ -605,7 +613,12 @@ def run_training_improved(
 
     # Only optimise non-frozen parameters.
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(
+        trainable_params,
+        lr=lr,
+        weight_decay=weight_decay,
+        eps=1e-6,
+    )
 
     total_steps = len(train_loader) * epochs
     warmup_steps = max(1, int(0.06 * total_steps))
@@ -707,14 +720,15 @@ def run_deberta_experiment(
 
     rng = np.random.RandomState(args.seed)
     for trial_id in range(args.n_trials):
+        # Conservative search space for stability on CUDA.
         params = {
-            "lr": float(np.exp(rng.uniform(np.log(1e-5), np.log(5e-5)))),
-            "batch_size": int(rng.choice([8, 16])),
+            "lr": float(np.exp(rng.uniform(np.log(5e-6), np.log(2e-5)))),
+            "batch_size": int(rng.choice([4, 8])),
             "epochs": int(rng.randint(min(2, args.epochs), args.epochs + 1)),
-            "weight_decay": float(rng.uniform(0.0, 0.1)),
-            "max_len": int(rng.choice([128, 256, 512])),
-            "focal_gamma": float(rng.uniform(0.5, 3.0)),
-            "focal_alpha": float(rng.uniform(0.25, 0.75)),
+            "weight_decay": float(rng.uniform(0.0, 0.05)),
+            "max_len": int(rng.choice([128, 256])),
+            "focal_gamma": float(rng.uniform(0.5, 2.0)),
+            "focal_alpha": float(rng.uniform(0.25, 0.65)),
         }
 
         logger.info(

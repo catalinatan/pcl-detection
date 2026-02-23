@@ -218,11 +218,24 @@ class FocalLoss(nn.Module):
         self.label_smoothing = label_smoothing
 
     def forward(self, logits, targets):
-        ce_loss = F.cross_entropy(
-            logits, targets, reduction="none",
-            label_smoothing=self.label_smoothing,
-        )
-        pt = torch.exp(-ce_loss)
+        logits = logits.float()  # cast to float32 for numerical stability
+        log_softmax = F.log_softmax(logits, dim=-1)
+        # log_pt ∈ (-inf, 0];  pt = softmax(logits)[target] ∈ [0, 1]
+        log_pt = log_softmax.gather(1, targets.view(-1, 1)).squeeze(1)
+        pt = log_pt.exp()
+
+        if self.label_smoothing > 0:
+            # Smooth CE: (1-ε)·(-log pt) + ε·(-mean log p)
+            ce_loss = -(
+                (1.0 - self.label_smoothing) * log_pt
+                + self.label_smoothing * log_softmax.mean(dim=-1)
+            )
+        else:
+            ce_loss = -log_pt
+
+        # Clamp prevents inf when pt ≈ 0 (random-init extreme logits)
+        ce_loss = ce_loss.clamp(max=100.0)
+
         alpha_t = torch.where(
             targets == 1,
             torch.full_like(pt, self.alpha),
@@ -243,6 +256,7 @@ def train_epoch(model, loader, optimizer, scheduler, loss_fn, device,
     _use_amp = (use_amp or scaler is not None) and device.type == "cuda"
     _amp_dtype = torch.float16 if scaler is not None else torch.bfloat16
     total_loss = 0.0
+    n_valid = 0
     for batch in loader:
         ids = batch["input_ids"].to(device)
         mask = batch["attention_mask"].to(device)
@@ -251,12 +265,12 @@ def train_epoch(model, loader, optimizer, scheduler, loss_fn, device,
         with torch.amp.autocast(device_type="cuda", enabled=_use_amp, dtype=_amp_dtype):
             logits = model(input_ids=ids, attention_mask=mask).logits
             if not torch.isfinite(logits).all():
-                logger.warning("    Non-finite logits detected; aborting epoch.")
-                return float("nan")
+                logger.warning("    Non-finite logits detected; skipping batch.")
+                continue
             loss = loss_fn(logits, labels)
             if not torch.isfinite(loss):
-                logger.warning("    Non-finite loss detected; aborting epoch.")
-                return float("nan")
+                logger.warning("    Non-finite loss detected; skipping batch.")
+                continue
         if _use_amp and scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -269,7 +283,11 @@ def train_epoch(model, loader, optimizer, scheduler, loss_fn, device,
             optimizer.step()
         scheduler.step()
         total_loss += loss.item()
-    return total_loss / max(len(loader), 1)
+        n_valid += 1
+    if n_valid == 0:
+        logger.warning("    All batches had non-finite loss; epoch failed.")
+        return float("nan")
+    return total_loss / n_valid
 
 
 @torch.no_grad()
@@ -621,7 +639,7 @@ def run_training_improved(
     )
 
     total_steps = len(train_loader) * epochs
-    warmup_steps = max(1, int(0.06 * total_steps))
+    warmup_steps = max(1, int(0.15 * total_steps))
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps,
     )

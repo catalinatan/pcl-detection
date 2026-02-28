@@ -890,7 +890,7 @@ def run_retrain(args, device: torch.device) -> None:
                 f"\n  [{label}] Step 1: Find best_epoch using 95/5 validation split"
             )
             # Split train+dev into 95% train, 5% validation
-            X_tr_95, X_val_5, y_tr_95, y_val_5 = stratified_split(
+            X_tr_95, y_tr_95, X_val_5, y_val_5 = stratified_split(
                 X_tr, y_tr, 0.95, args.seed
             )
             logger.info(

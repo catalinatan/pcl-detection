@@ -645,16 +645,7 @@ def run_hpo(args, device: torch.device) -> None:
     else:
         logger.info("\n  [DeBERTa] Skipped (--skip_deberta)")
 
-    # Save tuning log.
-    if tuning_rows:
-        log_path = outdir / TUNING_LOG_FILE
-        with open(log_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(tuning_rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(tuning_rows)
-        logger.info(f"\nTuning log → {log_path}")
-
-    # Save HPO results (also stores paths so later stages can find checkpoints).
+    # Save HPO results first — before anything else that could crash.
     results_path = outdir / HPO_RESULTS_FILE
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(hpo_results, f, indent=2)
@@ -871,21 +862,27 @@ def run_retrain(args, device: torch.device) -> None:
         use_sampler = is_deberta
         warmup_r    = 0.10 if is_deberta else 0.06
 
+        lr           = params.get("lr", 2e-5)
+        batch_size   = params.get("batch_size", 16)
+        epochs       = params.get("epochs", args.epochs)
+        weight_decay = params.get("weight_decay", 0.01)
+        max_len      = params.get("max_len", 256)
+
         logger.info(
             f"\n  [{label}] Retraining {approach_key} on {len(X_tr)} samples\n"
-            f"  Config: lr={params['lr']:.2e}  bs={params['batch_size']}  "
-            f"ep={params['epochs']}  max_len={params['max_len']}"
+            f"  Config: lr={lr:.2e}  bs={batch_size}  "
+            f"ep={epochs}  max_len={max_len}"
         )
         model, tokenizer, f1, _, ep = train_model(
             model_name=model_name,
             X_train=X_tr,  y_train=y_tr,
             X_dev=X_dev,   y_dev=y_dev,   # epoch selection monitor only
             device=device,
-            lr=params["lr"],
-            batch_size=params["batch_size"],
-            epochs=params["epochs"],
-            weight_decay=params["weight_decay"],
-            max_len=params["max_len"],
+            lr=lr,
+            batch_size=batch_size,
+            epochs=epochs,
+            weight_decay=weight_decay,
+            max_len=max_len,
             loss_mode=loss_mode,
             focal_alpha=params.get("focal_alpha", 0.75),
             focal_gamma=params.get("focal_gamma", 2.0),
@@ -1063,6 +1060,81 @@ def run_predict(args, device: torch.device) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Recover: rebuild hpo_results.json from saved checkpoints
+# ---------------------------------------------------------------------------
+
+def run_recover_hpo(args, device: torch.device) -> None:
+    """
+    Reconstructs hpo_results.json by evaluating each saved HPO checkpoint on
+    the internal dev split (same seed/ratio as HPO).  Run this when HPO
+    training finished but the JSON was not saved (e.g. due to a crash).
+    """
+    logger.info("\n" + "=" * 64)
+    logger.info("  RECOVER: rebuilding hpo_results.json from checkpoints")
+    logger.info("=" * 64)
+    outdir = Path(args.output_dir)
+
+    # Rebuild internal dev split (identical to run_hpo).
+    X_all, y_all = load_split(TRAIN_LABELS_PATH, PCL_TSV_PATH, "train")
+    _, _, X_dv, y_dv = stratified_split(X_all, y_all, 0.85, args.seed)
+    y_arr = np.array(y_dv)
+    logger.info(f"Internal dev: {len(X_dv)} samples  {int(y_arr.sum())} positives")
+
+    DEFAULTS = {"lr": 2e-5, "batch_size": 16, "epochs": args.epochs, "weight_decay": 0.01}
+
+    hpo_results: dict = {}
+    for approach, ckpt_name in CKPT_NAMES.items():
+        if approach == "deberta" and args.skip_deberta:
+            logger.info(f"\n[{approach}] skipped (--skip_deberta)")
+            continue
+        ckpt_dir = outdir / ckpt_name
+        if not ckpt_dir.exists():
+            logger.warning(f"\n[{approach}] checkpoint not found at {ckpt_dir} — skipping")
+            continue
+
+        logger.info(f"\n[{approach}] evaluating checkpoint at {ckpt_dir} ...")
+        model_name = DEBERTA_MODEL if approach == "deberta" else args.roberta_model
+        model_kwargs: dict = {"num_labels": 2, "ignore_mismatched_sizes": True}
+        if "deberta" in model_name.lower():
+            model_kwargs["attn_implementation"] = "eager"
+
+        tokenizer = AutoTokenizer.from_pretrained(str(ckpt_dir))
+        model = AutoModelForSequenceClassification.from_pretrained(str(ckpt_dir), **model_kwargs)
+        model.to(device).eval()
+
+        best_f1, best_thr, best_ml = 0.0, 0.5, 256
+        for ml in [128, 256]:
+            loader = DataLoader(
+                PCLDataset(X_dv, y_dv, tokenizer, ml),
+                batch_size=64, shuffle=False, num_workers=0,
+            )
+            probs, _ = get_probabilities(model, loader, device)
+            thr, f1 = tune_threshold(probs, y_arr)
+            logger.info(f"  max_len={ml}  F1={f1:.4f}  thr={thr:.2f}  std={probs.std():.4f}")
+            if f1 > best_f1:
+                best_f1, best_thr, best_ml = f1, thr, ml
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        params = {**DEFAULTS, "max_len": best_ml}
+        hpo_results[approach] = {
+            "f1": round(best_f1, 4),
+            "threshold": best_thr,
+            "params": params,
+            "checkpoint_dir": str(ckpt_dir),
+        }
+        logger.info(f"  → best: max_len={best_ml}  F1={best_f1:.4f}  thr={best_thr:.2f}")
+
+    out_path = outdir / HPO_RESULTS_FILE
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(hpo_results, f, indent=2)
+    logger.info(f"\nSaved → {out_path}")
+    logger.info(json.dumps(hpo_results, indent=2))
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1073,13 +1145,14 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["hpo", "compare", "retrain", "predict", "all"],
+        choices=["hpo", "compare", "retrain", "predict", "recover", "all"],
         default="all",
         help=(
             "hpo: HPO on internal split | "
             "compare: evaluate on official dev | "
             "retrain: retrain winner on train+dev | "
             "predict: generate test labels | "
+            "recover: rebuild hpo_results.json from saved checkpoints | "
             "all: run all stages"
         ),
     )
@@ -1128,6 +1201,8 @@ def main():
         run_retrain(args, device)
     elif args.mode == "predict":
         run_predict(args, device)
+    elif args.mode == "recover":
+        run_recover_hpo(args, device)
 
 
 if __name__ == "__main__":

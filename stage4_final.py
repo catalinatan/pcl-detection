@@ -841,9 +841,13 @@ def run_retrain(args, device: torch.device) -> None:
     X_dev,   y_dev   = load_split(DEV_LABELS_PATH,   PCL_TSV_PATH, "official_dev")
     X_combined = X_train + X_dev
     y_combined = y_train + y_dev
+
+    # Internal 15% split of train — used to tune dev_threshold (no leakage).
+    _, _, X_int_dv, y_int_dv = stratified_split(X_train, y_train, 0.85, args.seed)
     logger.info(
-        f"\n  train-only : {len(X_train)} samples\n"
-        f"  train+dev  : {len(X_combined)} samples"
+        f"\n  train-only    : {len(X_train)} samples"
+        f"\n  train+dev     : {len(X_combined)} samples"
+        f"\n  internal dev  : {len(X_int_dv)} samples (for dev_threshold tuning)"
     )
 
     def _retrain(approach_key: str, X_tr: list, y_tr: list,
@@ -909,6 +913,13 @@ def run_retrain(args, device: torch.device) -> None:
     else:
         keys = [best_approach]
 
+    def _tune_threshold_ensemble(ckpts: list, X: list, y: list, label: str) -> float:
+        """Infer with all ckpts, average probs, tune threshold. Returns best thr."""
+        probs = _infer_ensemble(ckpts, X, device)
+        thr, f1 = tune_threshold(probs, np.array(y))
+        logger.info(f"  [{label}] threshold={thr:.2f}  F1={f1:.4f}")
+        return thr
+
     # (a) Train on train-only → checkpoints for dev.txt
     logger.info("\n── (a) Train on train-only  →  dev.txt checkpoints ──────────")
     dev_ckpts: list = []
@@ -916,6 +927,10 @@ def run_retrain(args, device: torch.device) -> None:
         p = _retrain(k, X_train, y_train, FINAL_DEV_CKPT, "dev")
         if p:
             dev_ckpts.append(p)
+
+    # Tune dev_threshold on internal 15% split — zero leakage into dev.txt.
+    logger.info("\n  Tuning dev_threshold on internal 15% split (no dev leakage)...")
+    dev_threshold = _tune_threshold_ensemble(dev_ckpts, X_int_dv, y_int_dv, "dev_threshold")
 
     # (b) Train on train+dev → checkpoints for test.txt
     logger.info("\n── (b) Train on train+dev   →  test.txt checkpoints ─────────")
@@ -925,16 +940,21 @@ def run_retrain(args, device: torch.device) -> None:
         if p:
             test_ckpts.append(p)
 
+    # Tune test_threshold on official dev — valid since we already trained on dev.
+    logger.info("\n  Tuning test_threshold on official dev (already used for training)...")
+    test_threshold = _tune_threshold_ensemble(test_ckpts, X_dev, y_dev, "test_threshold")
+
     if not dev_ckpts or not test_ckpts:
         logger.error("  One or more checkpoints failed to save. Check errors above.")
         sys.exit(1)
 
     final_config = {
-        "best_approach":  best_approach,
-        "dev_f1":         comparison[best_approach]["official_dev_f1"],
-        "threshold":      threshold,
-        "dev_checkpoints":  dev_ckpts,   # train-only  → predict dev.txt
-        "test_checkpoints": test_ckpts,  # train+dev   → predict test.txt
+        "best_approach":    best_approach,
+        "dev_f1":           comparison[best_approach]["official_dev_f1"],
+        "dev_threshold":    dev_threshold,   # tuned on internal split, used for dev.txt
+        "test_threshold":   test_threshold,  # tuned on official dev, used for test.txt
+        "dev_checkpoints":  dev_ckpts,       # train-only  → predict dev.txt
+        "test_checkpoints": test_ckpts,      # train+dev   → predict test.txt
     }
     cfg_path = outdir / FINAL_CONFIG_FILE
     with open(cfg_path, "w", encoding="utf-8") as f:
@@ -942,7 +962,8 @@ def run_retrain(args, device: torch.device) -> None:
     logger.info(f"\nFinal config → {cfg_path}")
     logger.info(f"  dev_checkpoints  : {dev_ckpts}")
     logger.info(f"  test_checkpoints : {test_ckpts}")
-    logger.info(f"  threshold        : {threshold:.2f}")
+    logger.info(f"  dev_threshold    : {dev_threshold:.2f}")
+    logger.info(f"  test_threshold   : {test_threshold:.2f}")
 
 
 # ---------------------------------------------------------------------------
@@ -1008,10 +1029,12 @@ def run_predict(args, device: torch.device) -> None:
     with open(cfg_path) as f:
         final_config = json.load(f)
 
-    dev_ckpts  = final_config["dev_checkpoints"]
-    test_ckpts = final_config["test_checkpoints"]
-    threshold  = final_config["threshold"]
-    logger.info(f"\n  Threshold : {threshold:.2f}")
+    dev_ckpts       = final_config["dev_checkpoints"]
+    test_ckpts      = final_config["test_checkpoints"]
+    dev_threshold   = final_config["dev_threshold"]
+    test_threshold  = final_config["test_threshold"]
+    logger.info(f"\n  dev_threshold  : {dev_threshold:.2f}  (tuned on internal split)")
+    logger.info(f"  test_threshold : {test_threshold:.2f}  (tuned on official dev)")
     logger.info(f"  dev  checkpoints : {dev_ckpts}")
     logger.info(f"  test checkpoints : {test_ckpts}")
 
@@ -1025,7 +1048,7 @@ def run_predict(args, device: torch.device) -> None:
     logger.info(f"  Official dev: {len(X_dev_ordered)} paragraphs (in labels-file order)")
 
     dev_probs = _infer_ensemble(dev_ckpts, X_dev_ordered, device)
-    dev_preds = (dev_probs >= threshold).astype(int)
+    dev_preds = (dev_probs >= dev_threshold).astype(int)
     n_pcl     = int(dev_preds.sum())
     logger.info(
         f"  dev.txt: {n_pcl} PCL / {len(dev_preds)-n_pcl} No-PCL "
@@ -1046,7 +1069,7 @@ def run_predict(args, device: torch.device) -> None:
     logger.info(f"  Test set: {len(X_test_ordered)} paragraphs (in TSV row order)")
 
     test_probs = _infer_ensemble(test_ckpts, X_test_ordered, device)
-    test_preds = (test_probs >= threshold).astype(int)
+    test_preds = (test_probs >= test_threshold).astype(int)
     n_pcl      = int(test_preds.sum())
     logger.info(
         f"  test.txt: {n_pcl} PCL / {len(test_preds)-n_pcl} No-PCL "

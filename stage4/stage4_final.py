@@ -167,7 +167,7 @@ def read_labels(path: str) -> dict:
     with open(path, encoding="utf-8") as f:
         for row in csv.DictReader(f):
             vec = ast.literal_eval(row["label"])
-            labels[row["par_id"]] = 1 if sum(vec) > 0 else 0
+            labels[row["par_id"]] = int(1 if sum(vec) > 0 else 0)
     return labels
 
 
@@ -211,6 +211,8 @@ def stratified_split(
     X: list, y: list, train_ratio: float, seed: int
 ) -> tuple[list, list, list, list]:
     """Stratified split preserving class proportions."""
+    # Ensure labels are integers
+    y = [int(label) for label in y]
     idx = list(range(len(X)))
     tr_idx, dv_idx = train_test_split(
         idx, train_size=train_ratio, stratify=y, random_state=seed

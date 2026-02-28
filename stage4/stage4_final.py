@@ -231,7 +231,7 @@ def stratified_split(
 class PCLDataset(Dataset):
     def __init__(self, texts: list, labels: list, tokenizer, max_len: int):
         self.texts     = texts
-        self.labels    = labels
+        self.labels    = [int(l) for l in labels]
         self.tokenizer = tokenizer
         self.max_len   = max_len
 

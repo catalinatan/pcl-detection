@@ -928,9 +928,14 @@ def run_retrain(args, device: torch.device) -> None:
         if p:
             dev_ckpts.append(p)
 
-    # Tune dev_threshold on internal 15% split — zero leakage into dev.txt.
-    logger.info("\n  Tuning dev_threshold on internal 15% split (no dev leakage)...")
-    dev_threshold = _tune_threshold_ensemble(dev_ckpts, X_int_dv, y_int_dv, "dev_threshold")
+    # Tune dev_threshold using the HPO checkpoints on the internal 15% split.
+    # HPO checkpoints were trained on 85% of train — the internal 15% is genuinely
+    # held-out for them, so this threshold is unbiased.  We can't use the retrained
+    # models (trained on 100% of train) because those 15% examples are in their
+    # training set, and we can't use official dev (would leak into dev.txt).
+    logger.info("\n  Tuning dev_threshold: HPO checkpoints on internal 15% (genuinely held-out)...")
+    hpo_ckpts = [str(outdir / CKPT_NAMES[k]) for k in keys]
+    dev_threshold = _tune_threshold_ensemble(hpo_ckpts, X_int_dv, y_int_dv, "dev_threshold")
 
     # (b) Train on train+dev → checkpoints for test.txt
     logger.info("\n── (b) Train on train+dev   →  test.txt checkpoints ─────────")

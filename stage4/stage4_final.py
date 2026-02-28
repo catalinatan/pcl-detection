@@ -68,6 +68,12 @@ from transformers import (
 warnings.filterwarnings("ignore")
 
 # ---------------------------------------------------------------------------
+# Path resolution  (works regardless of where the script is invoked from)
+# ---------------------------------------------------------------------------
+_STAGE_DIR = Path(__file__).resolve().parent   # .../stage4/
+_BASE_DIR  = _STAGE_DIR.parent                 # project root
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
@@ -76,7 +82,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("stage4_final.log", mode="w"),
+        logging.FileHandler(str(_STAGE_DIR / "stage4_final.log"), mode="w"),
     ],
 )
 logger = logging.getLogger(__name__)
@@ -84,12 +90,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-TRAIN_LABELS_PATH = "train_semeval_parids-labels.csv"
-DEV_LABELS_PATH   = "dev_semeval_parids-labels.csv"
-PCL_TSV_PATH      = "dontpatronizeme_pcl.tsv"
+TRAIN_LABELS_PATH = str(_BASE_DIR / "dataset/train/labels/train_semeval_parids-labels.csv")
+DEV_LABELS_PATH   = str(_BASE_DIR / "dataset/train/labels/dev_semeval_parids-labels.csv")
+PCL_TSV_PATH      = str(_BASE_DIR / "dataset/train/data/dontpatronizeme_pcl.tsv")
 THRESHOLD_RANGE   = np.arange(0.00, 1.01, 0.01)
 DEBERTA_MODEL     = "microsoft/deberta-v3-base"
-OUTPUT_DIR        = "outputs_stage4"
+OUTPUT_DIR        = str(_STAGE_DIR / "outputs_stage4")
 
 # HPO checkpoint subdirectory names (saved after stage hpo).
 CKPT_NAMES = {
@@ -855,6 +861,10 @@ def run_retrain(args, device: torch.device) -> None:
         """
         Train one component of the best approach on (X_tr, y_tr).
         Returns the saved checkpoint path, or None on failure.
+        
+        For test checkpoints (train+dev combined):
+          - First trains on 95% with 5% validation to find best_epoch (no leakage)
+          - Then retrains on full 100% for that many epochs (maximizes data)
         """
         if approach_key not in hpo_results or hpo_results[approach_key]["f1"] <= 0.0:
             logger.error(f"  No valid HPO result for {approach_key}.")
@@ -872,31 +882,99 @@ def run_retrain(args, device: torch.device) -> None:
         weight_decay = params.get("weight_decay", 0.01)
         max_len      = params.get("max_len", 256)
 
-        logger.info(
-            f"\n  [{label}] Retraining {approach_key} on {len(X_tr)} samples\n"
-            f"  Config: lr={lr:.2e}  bs={batch_size}  "
-            f"ep={epochs}  max_len={max_len}"
-        )
-        model, tokenizer, f1, _, ep = train_model(
-            model_name=model_name,
-            X_train=X_tr,  y_train=y_tr,
-            X_dev=X_dev,   y_dev=y_dev,   # epoch selection monitor only
-            device=device,
-            lr=lr,
-            batch_size=batch_size,
-            epochs=epochs,
-            weight_decay=weight_decay,
-            max_len=max_len,
-            loss_mode=loss_mode,
-            focal_alpha=params.get("focal_alpha", 0.75),
-            focal_gamma=params.get("focal_gamma", 2.0),
-            use_sampler=use_sampler,
-            warmup_ratio=warmup_r,
-            patience=args.patience,
-            seed=args.seed,
-            trial_label=f"[{approach_key} {label}]",
-        )
-        logger.info(f"  Done — best_epoch={ep}  monitored_dev_f1={f1:.4f}")
+        # For test checkpoints (train+dev), use proper validation split to avoid overfitting
+        if label == "test":
+            logger.info(
+                f"\n  [{label}] Step 1: Find best_epoch using 95/5 validation split"
+            )
+            # Split train+dev into 95% train, 5% validation
+            X_tr_95, X_val_5, y_tr_95, y_val_5 = stratified_split(
+                X_tr, y_tr, 0.95, args.seed
+            )
+            logger.info(
+                f"  Training on {len(X_tr_95)} samples, validating on {len(X_val_5)} samples\n"
+                f"  Config: lr={lr:.2e}  bs={batch_size}  ep={epochs}  max_len={max_len}"
+            )
+            
+            # Train on 95% to find best epoch
+            model, tokenizer, f1, _, best_ep = train_model(
+                model_name=model_name,
+                X_train=X_tr_95,  y_train=y_tr_95,
+                X_dev=X_val_5,    y_dev=y_val_5,    # validation split (no leakage)
+                device=device,
+                lr=lr,
+                batch_size=batch_size,
+                epochs=epochs,
+                weight_decay=weight_decay,
+                max_len=max_len,
+                loss_mode=loss_mode,
+                focal_alpha=params.get("focal_alpha", 0.75),
+                focal_gamma=params.get("focal_gamma", 2.0),
+                use_sampler=use_sampler,
+                warmup_ratio=warmup_r,
+                patience=args.patience,
+                seed=args.seed,
+                trial_label=f"[{approach_key} {label}_find_epoch]",
+            )
+            logger.info(f"  Best epoch found: {best_ep}  (val F1={f1:.4f})")
+            
+            # Clean up
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Step 2: Retrain on full 100% for best_ep epochs (no validation)
+            logger.info(
+                f"\n  [{label}] Step 2: Retrain on full {len(X_tr)} samples for {best_ep} epochs"
+            )
+            model, tokenizer, _, _, _ = train_model(
+                model_name=model_name,
+                X_train=X_tr,  y_train=y_tr,        # Full train+dev
+                X_dev=X_tr[:100],  y_dev=y_tr[:100],  # Dummy (not used for selection)
+                device=device,
+                lr=lr,
+                batch_size=batch_size,
+                epochs=best_ep,                      # Fixed epochs from step 1
+                weight_decay=weight_decay,
+                max_len=max_len,
+                loss_mode=loss_mode,
+                focal_alpha=params.get("focal_alpha", 0.75),
+                focal_gamma=params.get("focal_gamma", 2.0),
+                use_sampler=use_sampler,
+                warmup_ratio=warmup_r,
+                patience=999,                        # No early stopping
+                seed=args.seed,
+                trial_label=f"[{approach_key} {label}_final]",
+            )
+            logger.info(f"  Done — trained for {best_ep} epochs on full data")
+        else:
+            # For other cases (e.g., dev checkpoints), use original validation
+            logger.info(
+                f"\n  [{label}] Retraining {approach_key} on {len(X_tr)} samples\n"
+                f"  Config: lr={lr:.2e}  bs={batch_size}  "
+                f"ep={epochs}  max_len={max_len}"
+            )
+            model, tokenizer, f1, _, ep = train_model(
+                model_name=model_name,
+                X_train=X_tr,  y_train=y_tr,
+                X_dev=X_dev,   y_dev=y_dev,
+                device=device,
+                lr=lr,
+                batch_size=batch_size,
+                epochs=epochs,
+                weight_decay=weight_decay,
+                max_len=max_len,
+                loss_mode=loss_mode,
+                focal_alpha=params.get("focal_alpha", 0.75),
+                focal_gamma=params.get("focal_gamma", 2.0),
+                use_sampler=use_sampler,
+                warmup_ratio=warmup_r,
+                patience=args.patience,
+                seed=args.seed,
+                trial_label=f"[{approach_key} {label}]",
+            )
+            logger.info(f"  Done — best_epoch={ep}  monitored_dev_f1={f1:.4f}")
+        
         ckpt = str(outdir / ckpt_map[approach_key])
         os.makedirs(ckpt, exist_ok=True)
         model.save_pretrained(ckpt)
@@ -1183,7 +1261,7 @@ def main():
     parser.add_argument(
         "--test_file",
         type=str,
-        default="task4_test.tsv",
+        default=str(_BASE_DIR / "dataset/test/data/task4_test.tsv"),
         help="Path to test TSV (required for predict/all). No label column expected.",
     )
     parser.add_argument("--epochs",        type=int,  default=6,

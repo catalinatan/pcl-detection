@@ -920,21 +920,17 @@ def run_retrain(args, device: torch.device) -> None:
         logger.info(f"  [{label}] threshold={thr:.2f}  F1={f1:.4f}")
         return thr
 
-    # (a) Train on train-only → checkpoints for dev.txt
-    logger.info("\n── (a) Train on train-only  →  dev.txt checkpoints ──────────")
-    dev_ckpts: list = []
-    for k in keys:
-        p = _retrain(k, X_train, y_train, FINAL_DEV_CKPT, "dev")
-        if p:
-            dev_ckpts.append(p)
-
-    # Tune dev_threshold using the HPO checkpoints on the internal 15% split.
-    # HPO checkpoints were trained on 85% of train — the internal 15% is genuinely
-    # held-out for them, so this threshold is unbiased.  We can't use the retrained
-    # models (trained on 100% of train) because those 15% examples are in their
-    # training set, and we can't use official dev (would leak into dev.txt).
-    logger.info("\n  Tuning dev_threshold: HPO checkpoints on internal 15% (genuinely held-out)...")
+    # (a) dev.txt: reuse HPO checkpoints directly — they were trained on 85% of
+    #     train with no dev labels, so they're valid for predicting on dev.
+    #     No need to retrain on 100% of train; the marginal gain is negligible
+    #     and the HPO checkpoints already give us a genuinely held-out threshold.
+    logger.info("\n── (a) dev.txt: reusing HPO checkpoints (no dev leakage) ────")
     hpo_ckpts = [str(outdir / CKPT_NAMES[k]) for k in keys]
+    for p in hpo_ckpts:
+        logger.info(f"  Using HPO checkpoint: {Path(p).name}")
+
+    # Tune dev_threshold: HPO checkpoints on internal 15% — genuinely held-out.
+    logger.info("\n  Tuning dev_threshold: HPO checkpoints × internal 15% split...")
     dev_threshold = _tune_threshold_ensemble(hpo_ckpts, X_int_dv, y_int_dv, "dev_threshold")
 
     # (b) Train on train+dev → checkpoints for test.txt
@@ -949,23 +945,23 @@ def run_retrain(args, device: torch.device) -> None:
     logger.info("\n  Tuning test_threshold on official dev (already used for training)...")
     test_threshold = _tune_threshold_ensemble(test_ckpts, X_dev, y_dev, "test_threshold")
 
-    if not dev_ckpts or not test_ckpts:
-        logger.error("  One or more checkpoints failed to save. Check errors above.")
+    if not test_ckpts:
+        logger.error("  test checkpoints failed to save. Check errors above.")
         sys.exit(1)
 
     final_config = {
         "best_approach":    best_approach,
         "dev_f1":           comparison[best_approach]["official_dev_f1"],
-        "dev_threshold":    dev_threshold,   # tuned on internal split, used for dev.txt
+        "dev_threshold":    dev_threshold,   # tuned on internal 15%, used for dev.txt
         "test_threshold":   test_threshold,  # tuned on official dev, used for test.txt
-        "dev_checkpoints":  dev_ckpts,       # train-only  → predict dev.txt
-        "test_checkpoints": test_ckpts,      # train+dev   → predict test.txt
+        "dev_checkpoints":  hpo_ckpts,       # HPO checkpoints (no dev leakage) → dev.txt
+        "test_checkpoints": test_ckpts,      # train+dev → test.txt
     }
     cfg_path = outdir / FINAL_CONFIG_FILE
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(final_config, f, indent=2)
     logger.info(f"\nFinal config → {cfg_path}")
-    logger.info(f"  dev_checkpoints  : {dev_ckpts}")
+    logger.info(f"  dev_checkpoints  : {hpo_ckpts}")
     logger.info(f"  test_checkpoints : {test_ckpts}")
     logger.info(f"  dev_threshold    : {dev_threshold:.2f}")
     logger.info(f"  test_threshold   : {test_threshold:.2f}")

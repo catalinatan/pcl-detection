@@ -858,6 +858,14 @@ def run_retrain(args, device: torch.device) -> None:
         f"\n  internal dev  : {len(X_int_dv)} samples (for dev_threshold tuning)"
     )
 
+    # Persist best_ep across crashes so Step 1 is never re-run unnecessarily.
+    state_path = outdir / "retrain_state.json"
+    retrain_state: dict = {}
+    if state_path.exists():
+        with open(state_path) as f:
+            retrain_state = json.load(f)
+        logger.info(f"  Loaded retrain state: {list(retrain_state.keys())}")
+
     def _retrain(approach_key: str, X_tr: list, y_tr: list,
                  ckpt_map: dict, label: str) -> str:
         """
@@ -886,45 +894,66 @@ def run_retrain(args, device: torch.device) -> None:
 
         # For test checkpoints (train+dev), use proper validation split to avoid overfitting
         if label == "test":
-            logger.info(
-                f"\n  [{label}] Step 1: Find best_epoch using 95/5 validation split"
-            )
-            # Split train+dev into 95% train, 5% validation
-            X_tr_95, y_tr_95, X_val_5, y_val_5 = stratified_split(
-                X_tr, y_tr, 0.95, args.seed
-            )
-            logger.info(
-                f"  Training on {len(X_tr_95)} samples, validating on {len(X_val_5)} samples\n"
-                f"  Config: lr={lr:.2e}  bs={batch_size}  ep={epochs}  max_len={max_len}"
-            )
-            
-            # Train on 95% to find best epoch
-            model, tokenizer, f1, _, best_ep = train_model(
-                model_name=model_name,
-                X_train=X_tr_95,  y_train=y_tr_95,
-                X_dev=X_val_5,    y_dev=y_val_5,    # validation split (no leakage)
-                device=device,
-                lr=lr,
-                batch_size=batch_size,
-                epochs=epochs,
-                weight_decay=weight_decay,
-                max_len=max_len,
-                loss_mode=loss_mode,
-                focal_alpha=params.get("focal_alpha", 0.75),
-                focal_gamma=params.get("focal_gamma", 2.0),
-                use_sampler=use_sampler,
-                warmup_ratio=warmup_r,
-                patience=args.patience,
-                seed=args.seed,
-                trial_label=f"[{approach_key} {label}_find_epoch]",
-            )
-            logger.info(f"  Best epoch found: {best_ep}  (val F1={f1:.4f})")
-            
-            # Clean up
-            del model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
+            ckpt = str(outdir / ckpt_map[approach_key])
+
+            # Skip entirely if the final checkpoint is already saved.
+            if os.path.isfile(os.path.join(ckpt, "config.json")):
+                logger.info(f"  [{approach_key}] Final checkpoint already exists → skipping.")
+                return ckpt
+
+            best_ep_key = f"{approach_key}_best_ep"
+            if best_ep_key in retrain_state:
+                best_ep = retrain_state[best_ep_key]
+                logger.info(
+                    f"\n  [{label}] Step 1 already done — loaded best_ep={best_ep} from retrain_state.json"
+                )
+            else:
+                logger.info(
+                    f"\n  [{label}] Step 1: Find best_epoch using 95/5 validation split"
+                )
+                # Split train+dev into 95% train, 5% validation
+                X_tr_95, y_tr_95, X_val_5, y_val_5 = stratified_split(
+                    X_tr, y_tr, 0.95, args.seed
+                )
+                logger.info(
+                    f"  Training on {len(X_tr_95)} samples, validating on {len(X_val_5)} samples\n"
+                    f"  Config: lr={lr:.2e}  bs={batch_size}  ep={epochs}  max_len={max_len}"
+                )
+
+                # Train on 95% to find best epoch
+                model, tokenizer, f1, _, best_ep = train_model(
+                    model_name=model_name,
+                    X_train=X_tr_95,  y_train=y_tr_95,
+                    X_dev=X_val_5,    y_dev=y_val_5,
+                    device=device,
+                    lr=lr,
+                    batch_size=batch_size,
+                    epochs=epochs,
+                    weight_decay=weight_decay,
+                    max_len=max_len,
+                    loss_mode=loss_mode,
+                    focal_alpha=params.get("focal_alpha", 0.75),
+                    focal_gamma=params.get("focal_gamma", 2.0),
+                    use_sampler=use_sampler,
+                    warmup_ratio=warmup_r,
+                    patience=args.patience,
+                    seed=args.seed,
+                    trial_label=f"[{approach_key} {label}_find_epoch]",
+                )
+                logger.info(f"  Best epoch found: {best_ep}  (val F1={f1:.4f})")
+
+                # Persist so Step 1 is skipped on rerun.
+                retrain_state[best_ep_key] = int(best_ep)
+                with open(state_path, "w") as f:
+                    json.dump(retrain_state, f, indent=2)
+                logger.info(f"  Saved best_ep={best_ep} → {state_path.name}")
+
+                del model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                import gc; gc.collect()
+
             # Step 2: Retrain on full 100% for best_ep epochs (no validation)
             logger.info(
                 f"\n  [{label}] Step 2: Retrain on full {len(X_tr)} samples for {best_ep} epochs"

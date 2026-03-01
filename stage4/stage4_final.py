@@ -31,13 +31,13 @@ DeBERTa fix (vs stage3_improved.py):
   (no alpha double-weighting) + warmup_ratio=0.10 + batch_size ∈ {16, 32}.
 
 Usage:
-  python stage4_final.py --mode all --test_file task4_test.tsv
-  python stage4_final.py --mode all --test_file task4_test.tsv --skip_deberta
+  python stage4_final.py --mode all
+  python stage4_final.py --mode all --skip_deberta
   python stage4_final.py --mode all --roberta_model roberta-large  # bigger model
   python stage4_final.py --mode hpo --n_trials 5
   python stage4_final.py --mode compare
   python stage4_final.py --mode retrain
-  python stage4_final.py --mode predict --test_file task4_test.tsv
+  python stage4_final.py --mode predict
 """
 
 import argparse
@@ -102,12 +102,6 @@ CKPT_NAMES = {
     "roberta_ce":    "hpo_roberta_ce_checkpoint",
     "roberta_focal": "hpo_roberta_focal_checkpoint",
     "deberta":       "hpo_deberta_checkpoint",
-}
-# Final checkpoints for dev predictions (trained on train only).
-FINAL_DEV_CKPT = {
-    "roberta_ce":    "final_dev_roberta_ce_checkpoint",
-    "roberta_focal": "final_dev_roberta_focal_checkpoint",
-    "deberta":       "final_dev_deberta_checkpoint",
 }
 # Final checkpoints for test predictions (trained on train + dev).
 FINAL_TEST_CKPT = {

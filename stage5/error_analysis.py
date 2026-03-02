@@ -11,7 +11,7 @@ Sections
 4. FP / FN example tables                     (binary preds)
 5. Model comparison bar chart                 (comparison_results.json)
 6. Precision-Recall curve + AUC-PR            (needs dev_probs.npy)
-7. Threshold tuning curve (F1 vs threshold)   (needs dev_probs.npy)
+7. P/R/F1 at discrete thresholds (0.10–0.50)  (needs dev_probs.npy)
 8. Calibration curve                          (needs dev_probs.npy)
 9. Length performance curve                   (binary preds)
 
@@ -300,24 +300,29 @@ def load_probs():
 # Section 6 — Precision-Recall Curve
 # ---------------------------------------------------------------------------
 
+BASELINE_ROBERTA = {"precision": 0.3935, "recall": 0.653}  # vanilla RoBERTa baseline
+
+
 def section6_pr_curve(gt_labels, probs):
     from sklearn.metrics import precision_recall_curve, auc
 
     precision, recall, thresholds = precision_recall_curve(gt_labels, probs)
-    auc_pr  = auc(recall, precision)
-    baseline = sum(gt_labels) / len(gt_labels)   # random classifier baseline
+    auc_pr = auc(recall, precision)
+
+    bp, br = BASELINE_ROBERTA["precision"], BASELINE_ROBERTA["recall"]
+    bf1 = 2 * bp * br / (bp + br)
 
     print("\n" + "=" * 55)
     print("SECTION 6 — Precision-Recall Curve")
     print("=" * 55)
-    print(f"  AUC-PR   : {auc_pr:.4f}")
-    print(f"  Baseline : {baseline:.4f}  (random classifier for {baseline*100:.1f}% positive rate)")
+    print(f"  AUC-PR            : {auc_pr:.4f}")
+    print(f"  Baseline RoBERTa  : P={bp:.4f}  R={br:.4f}  F1={bf1:.4f}")
 
     fig, ax = plt.subplots(figsize=(6, 5))
     ax.plot(recall, precision, color="steelblue", lw=2,
             label=f"Ensemble (AUC-PR = {auc_pr:.3f})")
-    ax.axhline(baseline, color="grey", linestyle="--", lw=1,
-               label=f"Random baseline ({baseline:.3f})")
+    ax.scatter([br], [bp], color="darkorange", s=80, zorder=5,
+               label=f"Baseline RoBERTa (P={bp:.3f}, R={br:.3f})")
     ax.set_xlabel("Recall")
     ax.set_ylabel("Precision")
     ax.set_title("Precision-Recall Curve (Positive Class = PCL)")
@@ -330,47 +335,62 @@ def section6_pr_curve(gt_labels, probs):
 
 
 # ---------------------------------------------------------------------------
-# Section 7 — Threshold Tuning Curve
+# Section 7 — Precision-Recall-F1 vs. Threshold (model characterisation)
 # ---------------------------------------------------------------------------
 
+USED_THRESHOLD = 0.37   # τ chosen on internal 15% split during HPO
+EVAL_THRESHOLDS = [0.10, 0.20, 0.30, 0.37, 0.40, 0.50]
+
+
 def section7_threshold_curve(gt_labels, probs):
+    """Precision/Recall/F1 at discrete operating points on the official dev set.
+
+    Model params are fixed; only the decision threshold τ varies.
+    τ=0.37 (marked with *) is the threshold chosen on an internal split during HPO.
+    """
     gt = np.array(gt_labels)
-    thresholds = np.linspace(0.0, 1.0, 201)
-    f1s, precs, recs = [], [], []
-
-    for thr in thresholds:
+    rows = []
+    for thr in EVAL_THRESHOLDS:
         preds = (probs >= thr).astype(int)
-        tp = ((preds == 1) & (gt == 1)).sum()
-        fp = ((preds == 1) & (gt == 0)).sum()
-        fn = ((preds == 0) & (gt == 1)).sum()
-        p  = tp / (tp + fp) if (tp + fp) else 0
-        r  = tp / (tp + fn) if (tp + fn) else 0
-        f  = 2 * p * r / (p + r) if (p + r) else 0
-        f1s.append(f); precs.append(p); recs.append(r)
-
-    best_idx = int(np.argmax(f1s))
-    best_thr = thresholds[best_idx]
-    best_f1  = f1s[best_idx]
+        tp = int(((preds == 1) & (gt == 1)).sum())
+        fp = int(((preds == 1) & (gt == 0)).sum())
+        fn = int(((preds == 0) & (gt == 1)).sum())
+        p  = tp / (tp + fp) if (tp + fp) else 0.0
+        r  = tp / (tp + fn) if (tp + fn) else 0.0
+        f  = 2 * p * r / (p + r) if (p + r) else 0.0
+        rows.append((thr, p, r, f, tp, fp, fn))
 
     print("\n" + "=" * 55)
-    print("SECTION 7 — Threshold Tuning Curve")
+    print("SECTION 7 — Precision / Recall / F1 at Discrete Thresholds")
     print("=" * 55)
-    print(f"  Best threshold : {best_thr:.2f}")
-    print(f"  Best F1        : {best_f1:.4f}")
-    print(f"  At τ=0.50      : F1={f1s[100]:.4f}  P={precs[100]:.4f}  R={recs[100]:.4f}")
+    print(f"  {'τ':>5}  {'Precision':>10}  {'Recall':>8}  {'F1':>8}  {'TP':>5}  {'FP':>5}  {'FN':>5}")
+    print("  " + "-" * 55)
+    for thr, p, r, f, tp, fp, fn in rows:
+        marker = " *" if thr == USED_THRESHOLD else "  "
+        print(f"  {thr:>5.2f}{marker}  {p:>10.4f}  {r:>8.4f}  {f:>8.4f}  {tp:>5}  {fp:>5}  {fn:>5}")
+    print("  (* = threshold used for dev.txt, chosen on internal HPO split)")
 
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(thresholds, f1s,   color="steelblue", lw=2, label="F1")
-    ax.plot(thresholds, precs, color="seagreen",  lw=1.5, linestyle="--", label="Precision")
-    ax.plot(thresholds, recs,  color="salmon",    lw=1.5, linestyle="--", label="Recall")
-    ax.axvline(best_thr, color="steelblue", linestyle=":", lw=1.5,
-               label=f"Best τ={best_thr:.2f} (F1={best_f1:.3f})")
-    ax.axvline(0.5, color="grey", linestyle=":", lw=1, label="Default τ=0.5")
-    ax.set_xlabel("Decision Threshold (τ)")
+    thr_labels = [f"τ={t}" + (" *" if t == USED_THRESHOLD else "") for t in EVAL_THRESHOLDS]
+    f1s   = [r[3] for r in rows]
+    precs = [r[1] for r in rows]
+    recs  = [r[2] for r in rows]
+
+    x = np.arange(len(EVAL_THRESHOLDS)); w = 0.25
+    colors = ["#c0392b" if t == USED_THRESHOLD else "steelblue" for t in EVAL_THRESHOLDS]
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.bar(x - w, precs, w, label="Precision", color="seagreen",  alpha=0.85)
+    ax.bar(x,     recs,  w, label="Recall",    color="salmon",    alpha=0.85)
+    ax.bar(x + w, f1s,   w, label="F1",        color="steelblue", alpha=0.85)
+    ax.set_xticks(x); ax.set_xticklabels(thr_labels, fontsize=9)
+    ax.set_ylim(0, 0.85)
     ax.set_ylabel("Score")
-    ax.set_title("F1 / Precision / Recall vs. Decision Threshold")
-    ax.legend(fontsize=8)
-    ax.set_xlim([0, 1]); ax.set_ylim([0, 1])
+    ax.set_title("Precision / Recall / F1 at Discrete Decision Thresholds\n"
+                 "(best model, fixed params — * = deployed threshold τ=0.37)")
+    ax.legend()
+    for i, (p, r, f) in enumerate(zip(precs, recs, f1s)):
+        ax.text(i - w, p + 0.01, f"{p:.2f}", ha="center", fontsize=7)
+        ax.text(i,     r + 0.01, f"{r:.2f}", ha="center", fontsize=7)
+        ax.text(i + w, f + 0.01, f"{f:.2f}", ha="center", fontsize=7)
     plt.tight_layout()
     path = OUT_DIR / "fig6_threshold_curve.png"
     plt.savefig(path, dpi=150); plt.close()

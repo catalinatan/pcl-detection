@@ -170,3 +170,89 @@ EDA Analysis Complete!
 2026-02-28 14:27:55,151 - INFO -   - eda_1_binary.png
 2026-02-28 14:27:55,151 - INFO -   - eda_2_train_ngrams.png
 2026-02-28 14:27:55,151 - INFO -   - eda_analysis.log
+2026-03-02 15:36:55,119 - INFO - Starting EDA Analysis
+2026-03-02 15:36:55,120 - INFO - Loading data files...
+2026-03-02 15:36:55,150 - INFO - Loaded 10469 texts from /Users/catalina.angelia/Coding_Projects/Code/NLPLabs-2024/dataset/train/data/dontpatronizeme_pcl.tsv
+2026-03-02 15:36:55,151 - INFO - 
+======================================================================
+2026-03-02 15:36:55,151 - INFO - Analyzing TRAINING SET
+2026-03-02 15:36:55,151 - INFO - ======================================================================
+2026-03-02 15:36:55,296 - INFO - 
+========================================================
+2026-03-02 15:36:55,296 - INFO - EDA 1: BINARY CLASSIFICATION (PCL vs No PCL)
+2026-03-02 15:36:55,296 - INFO - ========================================================
+2026-03-02 15:36:55,296 - INFO - Class                     Count    Percentage
+2026-03-02 15:36:55,296 - INFO - ----------------------------------------------
+2026-03-02 15:36:55,296 - INFO - PCL                         794          9.5%
+2026-03-02 15:36:55,296 - INFO - No PCL                     7581         90.5%
+2026-03-02 15:36:55,296 - INFO - Total                      8375
+2026-03-02 15:36:55,296 - INFO - 
+======================================================================
+2026-03-02 15:36:55,296 - INFO - EDA 2: N-GRAM ANALYSIS (Most Common Phrases)
+2026-03-02 15:36:55,296 - INFO - ======================================================================
+2026-03-02 15:36:55,296 - INFO - 
+Top 10 Bigrams in PCL paragraphs:
+2026-03-02 15:36:55,296 - INFO - Rank   Bigram                                        Count
+2026-03-02 15:36:55,296 - INFO - ----------------------------------------------------------------------
+2026-03-02 15:36:55,361 - INFO - 1      poor families                                   112
+2026-03-02 15:36:55,361 - INFO - 2      people need                                      26
+2026-03-02 15:36:55,361 - INFO - 3      homeless people                                  24
+2026-03-02 15:36:55,361 - INFO - 4      children poor                                    19
+2026-03-02 15:36:55,361 - INFO - 5      help need                                        16
+2026-03-02 15:36:55,361 - INFO - 6      year old                                         11
+2026-03-02 15:36:55,361 - INFO - 7      men women                                        11
+2026-03-02 15:36:55,362 - INFO - 8      disabled people                                  10
+2026-03-02 15:36:55,362 - INFO - 9      hundreds thousands                               10
+2026-03-02 15:36:55,362 - INFO - 10     vulnerable people                                 9
+2026-03-02 15:36:55,362 - INFO - 
+Top 10 Bigrams in No PCL paragraphs:
+2026-03-02 15:36:55,362 - INFO - Rank   Bigram                                        Count
+2026-03-02 15:36:55,362 - INFO - ----------------------------------------------------------------------
+2026-03-02 15:36:55,930 - INFO - 1      poor families                                   617
+2026-03-02 15:36:55,930 - INFO - 2      illegal immigrants                              239
+2026-03-02 15:36:55,930 - INFO - 3      united states                                   128
+2026-03-02 15:36:55,930 - INFO - 4      year old                                         95
+2026-03-02 15:36:55,930 - INFO - 5      disabled people                                  94
+2026-03-02 15:36:55,930 - INFO - 6      new york                                         86
+2026-03-02 15:36:55,930 - INFO - 7      sri lanka                                        85
+2026-03-02 15:36:55,930 - INFO - 8      homeless people                                  84
+2026-03-02 15:36:55,930 - INFO - 9      hong kong                                        80
+2026-03-02 15:36:55,930 - INFO - 10     men women                                        78
+2026-03-02 15:36:55,930 - INFO - 
+Top 10 Trigrams in PCL paragraphs:
+2026-03-02 15:36:55,930 - INFO - Rank   Trigram                                       Count
+2026-03-02 15:36:55,930 - INFO - ----------------------------------------------------------------------
+2026-03-02 15:36:55,994 - INFO - 1      children poor families                           19
+2026-03-02 15:36:55,994 - INFO - 2      help poor families                                4
+2026-03-02 15:36:55,994 - INFO - 3      come poor families                                4
+2026-03-02 15:36:55,994 - INFO - 4      brought united states                             4
+2026-03-02 15:36:55,994 - INFO - 5      poor families given                               3
+2026-03-02 15:36:55,994 - INFO - 6      think poor families                               3
+2026-03-02 15:36:55,994 - INFO - 7      urban poor families                               3
+2026-03-02 15:36:55,994 - INFO - 8      food poor families                                3
+2026-03-02 15:36:55,994 - INFO - 9      hundreds thousands refugees                       3
+2026-03-02 15:36:55,994 - INFO - 10     united states illegally                           3
+2026-03-02 15:36:55,994 - INFO - 
+Top 10 Trigrams in No PCL paragraphs:
+2026-03-02 15:36:55,994 - INFO - Rank   Trigram                                       Count
+2026-03-02 15:36:55,994 - INFO - ----------------------------------------------------------------------
+2026-03-02 15:36:56,594 - INFO - 1      children poor families                           48
+2026-03-02 15:36:56,594 - INFO - 2      president donald trump                           43
+2026-03-02 15:36:56,594 - INFO - 3      students poor families                           27
+2026-03-02 15:36:56,594 - INFO - 4      come poor families                               20
+2026-03-02 15:36:56,594 - INFO - 5      world war ii                                     15
+2026-03-02 15:36:56,594 - INFO - 6      need humanitarian assistance                     13
+2026-03-02 15:36:56,594 - INFO - 7      president barack obama                           13
+2026-03-02 15:36:56,594 - INFO - 8      working poor families                            12
+2026-03-02 15:36:56,595 - INFO - 9      chancellor angela merkel                         11
+2026-03-02 15:36:56,595 - INFO - 10     muslim majority countries                        11
+2026-03-02 15:36:56,595 - INFO - 
+Generating visualizations...
+2026-03-02 15:36:57,450 - INFO - Saved: eda_1_binary.png
+2026-03-02 15:36:57,832 - INFO - Saved: eda_2_train_ngrams.png
+2026-03-02 15:36:57,832 - INFO - 
+EDA Analysis Complete!
+2026-03-02 15:36:57,832 - INFO - Generated files:
+2026-03-02 15:36:57,832 - INFO -   - eda_1_binary.png
+2026-03-02 15:36:57,832 - INFO -   - eda_2_train_ngrams.png
+2026-03-02 15:36:57,832 - INFO -   - eda_analysis.log

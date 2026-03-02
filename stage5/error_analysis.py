@@ -300,33 +300,49 @@ def load_probs():
 # Section 6 — Precision-Recall Curve
 # ---------------------------------------------------------------------------
 
-BASELINE_ROBERTA = {"precision": 0.3935, "recall": 0.653}  # vanilla RoBERTa baseline
-
-
 def section6_pr_curve(gt_labels, probs):
     from sklearn.metrics import precision_recall_curve, auc
 
     precision, recall, thresholds = precision_recall_curve(gt_labels, probs)
     auc_pr = auc(recall, precision)
 
-    bp, br = BASELINE_ROBERTA["precision"], BASELINE_ROBERTA["recall"]
-    bf1 = 2 * bp * br / (bp + br)
+    # Also plot ensemble operating points at the discrete eval thresholds
+    gt = np.array(gt_labels)
+    op_recalls, op_precs = [], []
+    for thr in EVAL_THRESHOLDS:
+        preds = (probs >= thr).astype(int)
+        tp = int(((preds == 1) & (gt == 1)).sum())
+        fp = int(((preds == 1) & (gt == 0)).sum())
+        fn = int(((preds == 0) & (gt == 1)).sum())
+        p  = tp / (tp + fp) if (tp + fp) else 0.0
+        r  = tp / (tp + fn) if (tp + fn) else 0.0
+        op_recalls.append(r); op_precs.append(p)
 
     print("\n" + "=" * 55)
     print("SECTION 6 — Precision-Recall Curve")
     print("=" * 55)
-    print(f"  AUC-PR            : {auc_pr:.4f}")
-    print(f"  Baseline RoBERTa  : P={bp:.4f}  R={br:.4f}  F1={bf1:.4f}")
+    print(f"  AUC-PR : {auc_pr:.4f}")
 
     fig, ax = plt.subplots(figsize=(6, 5))
     ax.plot(recall, precision, color="steelblue", lw=2,
             label=f"Ensemble (AUC-PR = {auc_pr:.3f})")
-    ax.scatter([br], [bp], color="darkorange", s=80, zorder=5,
-               label=f"Baseline RoBERTa (P={bp:.3f}, R={br:.3f})")
+    for thr, r, p in zip(EVAL_THRESHOLDS, op_recalls, op_precs):
+        marker = "*" if thr == USED_THRESHOLD else "o"
+        size   = 120 if thr == USED_THRESHOLD else 50
+        ax.scatter([r], [p], marker=marker, s=size, zorder=5,
+                   color="darkorange" if thr == USED_THRESHOLD else "grey")
+        is_used = (thr == USED_THRESHOLD)
+        ax.annotate(f"τ={thr}", (r, p), textcoords="offset points",
+                    xytext=(-8, -12) if is_used else (5, 4),
+                    ha="right" if is_used else "left",
+                    fontsize=7,
+                    color="darkorange" if is_used else "grey")
+    ax.scatter([], [], marker="*", s=120, color="darkorange", label="τ=0.37 (deployed)")
+    ax.scatter([], [], marker="o", s=50,  color="grey",       label="Other τ values")
     ax.set_xlabel("Recall")
     ax.set_ylabel("Precision")
     ax.set_title("Precision-Recall Curve (Positive Class = PCL)")
-    ax.legend()
+    ax.legend(fontsize=8)
     ax.set_xlim([0, 1]); ax.set_ylim([0, 1.05])
     plt.tight_layout()
     path = OUT_DIR / "fig5_pr_curve.png"
@@ -376,11 +392,13 @@ def section7_threshold_curve(gt_labels, probs):
     recs  = [r[2] for r in rows]
 
     x = np.arange(len(EVAL_THRESHOLDS)); w = 0.25
-    colors = ["#c0392b" if t == USED_THRESHOLD else "steelblue" for t in EVAL_THRESHOLDS]
     fig, ax = plt.subplots(figsize=(8, 4))
-    ax.bar(x - w, precs, w, label="Precision", color="seagreen",  alpha=0.85)
-    ax.bar(x,     recs,  w, label="Recall",    color="salmon",    alpha=0.85)
-    ax.bar(x + w, f1s,   w, label="F1",        color="steelblue", alpha=0.85)
+    ax.bar(x - w, precs, w, label="Precision", color="seagreen",  alpha=0.6)
+    ax.bar(x,     recs,  w, label="Recall",    color="salmon",    alpha=0.6)
+    ax.bar(x + w, f1s,   w, label="F1",        color="steelblue", alpha=0.6)
+    ax.plot(x - w, precs, "o-", color="seagreen",  lw=1.5, markersize=5)
+    ax.plot(x,     recs,  "o-", color="salmon",    lw=1.5, markersize=5)
+    ax.plot(x + w, f1s,   "o-", color="steelblue", lw=1.5, markersize=5)
     ax.set_xticks(x); ax.set_xticklabels(thr_labels, fontsize=9)
     ax.set_ylim(0, 0.85)
     ax.set_ylabel("Score")
@@ -388,9 +406,9 @@ def section7_threshold_curve(gt_labels, probs):
                  "(best model, fixed params — * = deployed threshold τ=0.37)")
     ax.legend()
     for i, (p, r, f) in enumerate(zip(precs, recs, f1s)):
-        ax.text(i - w, p + 0.01, f"{p:.2f}", ha="center", fontsize=7)
-        ax.text(i,     r + 0.01, f"{r:.2f}", ha="center", fontsize=7)
-        ax.text(i + w, f + 0.01, f"{f:.2f}", ha="center", fontsize=7)
+        ax.text(i - w, p + 0.02, f"{p:.2f}", ha="center", fontsize=7)
+        ax.text(i,     r + 0.02, f"{r:.2f}", ha="center", fontsize=7)
+        ax.text(i + w, f + 0.02, f"{f:.2f}", ha="center", fontsize=7)
     plt.tight_layout()
     path = OUT_DIR / "fig6_threshold_curve.png"
     plt.savefig(path, dpi=150); plt.close()

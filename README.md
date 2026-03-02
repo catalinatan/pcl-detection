@@ -1,93 +1,149 @@
-# nlp
+# SemEval 2022 Task 4 — Patronizing and Condescending Language Detection
 
+**Task:** Binary classification — given a paragraph, predict whether it contains Patronizing and Condescending Language (PCL) towards a vulnerable group.
+**Dataset:** DontPatronizeMe (Pérez-Almendros et al., 2020)
+**Best model:** Probability-averaging ensemble of two fine-tuned RoBERTa-base classifiers.
 
+---
 
-## Getting started
+## Quickstart: Finding the Predictions
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+The submission files are committed directly to the repo — no re-running is needed to mark them.
 
 ```
-cd existing_repo
-git remote add origin https://gitlab.doc.ic.ac.uk/ct1222/nlp.git
-git branch -M master
-git push -uf origin master
+predictions/
+├── dev.txt    # 2094 lines, one prediction per line (0 = No PCL, 1 = PCL)
+└── test.txt   # 3832 lines, one prediction per line
 ```
 
-## Integrate with your tools
+`dev.txt` was generated using a model trained on the training set only (no dev leakage).
+`test.txt` was generated using a model trained on train + dev combined.
 
-* [Set up project integrations](https://gitlab.doc.ic.ac.uk/ct1222/nlp/-/settings/integrations)
+---
 
-## Collaborate with your team
+## Repository Structure
 
-* [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+```
+.
+├── predictions/              # Final submission files (dev.txt, test.txt)
+├── BestModel/
+│   └── best_model.ipynb      # Walkthrough notebook — start here to reproduce results
+├── stage2/
+│   ├── stage2.py             # Exploratory Data Analysis (EDA)
+│   ├── eda_1_binary.png      # Class distribution plot
+│   └── eda_2_train_ngrams.png# N-gram frequency analysis
+├── stage4/
+│   ├── stage4_final.py       # Full training pipeline (HPO → compare → retrain → predict)
+│   └── outputs_stage4/       # Saved checkpoints and results
+│       ├── comparison_results.json   # Dev F1 for each approach
+│       ├── final_config.json         # Thresholds and checkpoint paths used for predictions
+│       └── hpo_roberta_*_checkpoint/ # Best HPO checkpoints (used for dev.txt)
+├── stage5/
+│   ├── error_analysis.py     # Generates all error analysis figures and tables
+│   ├── save_probs.py         # Generates dev_probs.npy (needs GPU + checkpoints)
+│   ├── dev_probs.npy         # Cached ensemble probabilities on dev set
+│   ├── fig1_confusion_matrix.png
+│   ├── fig2_category_miss_rate.png
+│   ├── fig3_annotator_score.png
+│   ├── fig4_model_comparison.png
+│   ├── fig5_pr_curve.png
+│   ├── fig6_threshold_curve.png
+│   ├── fig7_calibration.png
+│   ├── fig8_length_curve.png
+│   ├── fp_cases.csv          # All false positive examples
+│   └── fn_cases.csv          # All false negative examples
+├── dataset/                  # Dataset files (not committed — place here before running)
+│   └── train/
+│       ├── data/dontpatronizeme_pcl.tsv
+│       └── labels/
+│           ├── train_semeval_parids-labels.csv
+│           └── dev_semeval_parids-labels.csv
+│   └── test/
+│       └── data/task4_test.tsv
+└── requirements.txt
+```
 
-## Test and Deploy
+---
 
-Use the built-in continuous integration in GitLab.
+## Approach Summary
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+The dataset has severe class imbalance (~9.5% positive). A single loss function creates a precision-recall trade-off:
 
-***
+| Model | Dev F1 | Precision | Recall |
+|---|---|---|---|
+| RoBERTa + cross-entropy | 0.5954 | 0.603 | 0.588 |
+| RoBERTa + focal loss | 0.5948 | 0.557 | 0.638 |
+| **Ensemble (average probs)** | **0.5967** | 0.568 | 0.628 |
+| DeBERTa-v3-base | 0.173 | 0.095 | 1.000 |
 
-# Editing this README
+Averaging the two RoBERTa models balances their complementary biases (CE is more precise; focal loss is more sensitive), achieving the best F1.
+DeBERTa collapsed to predicting all positives due to batch-level class imbalance instability.
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+---
 
-## Suggestions for a good README
+## Reproducing Results (requires GPU)
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+The notebook **`BestModel/best_model.ipynb`** walks through each step. Alternatively, run the pipeline directly:
 
-## Name
-Choose a self-explaining name for your project.
+### 1. Install dependencies
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+```bash
+# GPU (Azure / CUDA 12.x) — install torch first:
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+pip install -r requirements.txt
+```
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+### 2. Run the full pipeline
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+```bash
+# Step 1 — Hyperparameter optimisation (5 trials per model, ~1–2 hrs on GPU)
+python stage4/stage4_final.py --mode hpo
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+# Step 2 — Compare models on official dev set
+python stage4/stage4_final.py --mode compare
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+# Step 3 — Retrain on full data
+python stage4/stage4_final.py --mode retrain
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+# Step 4 — Generate predictions
+python stage4/stage4_final.py --mode predict
+# Outputs: stage4/outputs_stage4/dev.txt and test.txt
+# (also committed to predictions/ for convenience)
+```
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+Or run all steps at once:
+```bash
+python stage4/stage4_final.py --mode all
+```
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+### 3. Reproduce EDA figures
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+```bash
+python stage2/stage2.py
+# Outputs: stage2/eda_1_binary.png, stage2/eda_2_train_ngrams.png
+```
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+### 4. Reproduce error analysis figures
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+All figures in `stage5/` are pre-generated and committed. To regenerate:
 
-## License
-For open source projects, say how it is licensed.
+```bash
+python stage5/error_analysis.py
+# Outputs: stage5/fig1–fig8 .png, fp_cases.csv, fn_cases.csv
+```
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+> `dev_probs.npy` (ensemble probabilities on the dev set) is already committed.
+> If it needs to be regenerated, run `python stage5/save_probs.py` on a machine with GPU and the HPO checkpoints.
+
+---
+
+## Dataset Setup
+
+The dataset is not included in the repo. Place files as follows before running:
+
+```
+dataset/train/data/dontpatronizeme_pcl.tsv
+dataset/train/labels/train_semeval_parids-labels.csv
+dataset/train/labels/dev_semeval_parids-labels.csv
+dataset/test/data/task4_test.tsv
+```

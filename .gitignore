@@ -1,3 +1,4 @@
+# Byte-compiled / optimised / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -51,4 +52,31 @@ poetry.lock
 # macOS
 .DS_Store
 
+# Claude
 .claude/
+
+# ── Project-specific ────────────────────────────────────────────────────────
+
+# Dataset (not redistributed — see README for download instructions)
+dataset/
+
+# Model weights and checkpoints (large binary artifacts)
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+stage4/outputs_stage4/
+**/checkpoints/
+**/hpo_*_checkpoint/
+**/final_*_checkpoint/
+
+# Training / evaluation logs
+*.log
+runs/
+wandb/
+logs/
+
+# Cached HuggingFace artifacts
+.cache/
+.hf_cache/
